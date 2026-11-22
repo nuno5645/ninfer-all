@@ -1,0 +1,45 @@
+name: HP build (sm_75)
+on:
+  workflow_dispatch:
+  push:
+    branches: [hp-tune]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13-slim
+      volumes: ["/usr/share/dotnet:/host-tools/dotnet","/usr/local/lib/android:/host-tools/android","/opt/hostedtoolcache:/host-tools/toolcache","/opt/ghc:/host-tools/ghc"]
+    timeout-minutes: 350
+    defaults: { run: { shell: bash } }
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CUDA_VERSION: 12.9.2
+      ARCHS: "75"
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - name: Free disk
+        run: rm -rf /host-tools/*/* || true; df -h /__w
+      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Toolkit
+        run: .github/scripts/install-linux-release-tools.sh
+      - name: Configure
+        run: |
+          webui="$(scripts/fetch-webui.sh | sed -n 's/^configure with -DNINFER_WEBUI_DIR=//p')"
+          scripts/fetch-media-sources.sh
+          cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_SHARED_RUNTIME=ON \
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON -DNINFER_WEBUI_DIR="$webui"
+      - name: Build
+        run: cmake --build build-release -j "$(nproc)" --target ninfer-serve ninfer-calibrate ninfer_bench
+      - name: Collect
+        run: |
+          mkdir -p out
+          find build-release -maxdepth 3 -type f \( -name 'ninfer-serve' -o -name 'ninfer-calibrate' -o -name 'ninfer_bench' -o -name 'libninfer-runtime.so*' \) -exec cp -v {} out/ \;
+          git rev-parse HEAD > out/REV; ls -la out
+      - uses: actions/upload-artifact@v4
+        with: { name: ninfer-hp-sm75, path: out/, retention-days: 7 }

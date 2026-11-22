@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "models/inkling2/executor.h"
 
 #include "core/decode_graph.h"
@@ -1269,6 +1271,15 @@ struct Executor::Impl {
             transport.cpu.balance       = !options.expert_dma_share;
             transport.cpu.threads       = options.expert_cpu_threads;
         }
+        // hp-tune: the tier's constants from the environment (they were tuned on Flash-Next, whose
+        // layers run once a token; Inkling 2's loop counts three passes a token).
+        if (const char* e = std::getenv("NINFER_TIER_EVERY")) { transport.tier.every = std::uint32_t(std::atoi(e)); }
+        if (const char* e = std::getenv("NINFER_TIER_SWAPS")) { transport.tier.swaps = std::uint32_t(std::atoi(e)); }
+        if (const char* e = std::getenv("NINFER_TIER_DECAY")) { transport.tier.decay = float(std::atof(e)); }
+        if (const char* e = std::getenv("NINFER_TIER_GAIN"))  { transport.tier.min_gain = float(std::atof(e)); }
+        std::fprintf(stderr, "hp-tune: tier every=%u swaps=%u decay=%.2f gain=%.2f reserve=%zu MiB headroom=%zu MiB\n",
+                     unsigned(transport.tier.every), unsigned(transport.tier.swaps), double(transport.tier.decay),
+                     double(transport.tier.min_gain), kGraphReserve >> 20, kKvHeadroom >> 20);
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
         // Where a device's copies queue behind one another whatever their streams
@@ -1288,8 +1299,12 @@ struct Executor::Impl {
     }
 
     static constexpr std::uint32_t kFullChunk  = 2048;
-    static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
-    static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
+    static std::size_t env_mib(const char* name, std::size_t fallback) {
+        const char* e = std::getenv(name);
+        return (e != nullptr && std::atoi(e) > 0 ? std::size_t(std::atoi(e)) : fallback) << 20;
+    }
+    static inline const std::size_t kGraphReserve = env_mib("NINFER_GRAPH_RESERVE_MIB", 320);
+    static inline const std::size_t kKvHeadroom   = env_mib("NINFER_KV_HEADROOM_MIB", 256);
 
     // ---- Growing caches --------------------------------------------------------------------------
 

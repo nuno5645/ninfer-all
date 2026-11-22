@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include "runtime/engine/inkling2_core.h"
 
 #include "artifact/formats.h"
@@ -284,14 +287,23 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     // experts' matrix kernel fills its widest tile only at wide chunks, and larger chunks grow the
     // sliding-window rings (window + chunk). A device without room for that chunk's workspace takes
     // the widest of 1024 and 512 that fits.
-    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
+    // hp-tune: NINFER_INK_CHUNK=N (a multiple of 128) starts the fallback at N instead of 2048.
+    std::vector<std::uint32_t> chunks{2048u, 1024u, 512u};
+    if (const char* e = std::getenv("NINFER_INK_CHUNK"); e != nullptr && std::atoi(e) >= 128) {
+        const auto c = std::uint32_t(std::atoi(e)) / 128u * 128u;
+        chunks.clear();
+        for (std::uint32_t x = c; x >= 512u; x /= 2u) { chunks.push_back(x / 128u * 128u); }
+        if (chunks.empty() || chunks.back() != 512u) { chunks.push_back(512u); }
+        std::fprintf(stderr, "hp-tune: Inkling 2 prompt chunk %u\n", unsigned(chunks.front()));
+    }
+    for (const std::uint32_t chunk : chunks) {
         executor.prefill_chunk = chunk;
         try {
             instance->executor =
                 std::make_unique<models::inkling2::Executor>(*model, device, executor);
             break;
         } catch (const models::inkling2::InsufficientMemory&) {
-            if (chunk == 512) { throw; }
+            if (chunk == chunks.back()) { throw; }
         }
     }
     device.synchronize();
