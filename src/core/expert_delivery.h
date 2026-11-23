@@ -192,6 +192,18 @@ struct ExpertDeliveryMemory {
     std::uint32_t cache_slots = 0, banks = 0, lent_slots = 0;
 };
 
+// hp-tune (miss-skip), ExpertDelivery::Skip: a decode call's routing weights
+// ([pairs / top_k][top_k], each the route's probability times scale[expert] when `scale` is set, else times one constant). With
+// NINFER_MISS_SKIP_RANK / NINFER_MISS_SKIP_W set, a narrow call drops each expert that misses
+// and whose every pair ranks at or past the rank, or weighs below the share, of its row: it
+// leaves both sets, is neither copied nor computed on the CPU, and its pairs' weights become
+// zero (NINFER_MISS_SKIP_RENORM: the row's other weights keep the row's sum).
+struct ExpertDeliverySkip {
+    float* weights      = nullptr;
+    const float* scale  = nullptr;
+    int top_k           = 0;
+};
+
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
@@ -244,15 +256,20 @@ public:
         const void* data = nullptr;
         std::size_t bytes = 0;
     };
+    using Skip = ExpertDeliverySkip;
 
     // Capturable. The next begin must follow every consumer of the preceding call on stream, and
     // every begin needs its await. Cached pairs can run immediately. Missing pairs run only after
     // await(); with a CPU share they exclude the CPU's pairs, whose products the family adds then.
-    // Neither set drops or renormalizes routes; an expert's pairs all fall in one set. `inputs`
+    // Neither set drops or renormalizes routes (except with `skip`, see Skip); an expert's pairs
+    // all fall in one set. `inputs`
     // (device ranges, ExpertCpuOptions::input_bytes in all) reach the CPU's products; a call
     // without them leaves nothing to the CPU (call.products and call.cpu stay null).
     [[nodiscard]] Call begin(std::size_t layer, const std::int32_t* ids, std::uint32_t pairs,
-                             cudaStream_t stream, std::span<const Input> inputs = {});
+                             cudaStream_t stream, std::span<const Input> inputs = {},
+                             Skip skip = {});
+    // hp-tune: whether NINFER_MISS_SKIP_RANK or NINFER_MISS_SKIP_W enabled miss-skip.
+    [[nodiscard]] bool miss_skip() const noexcept;
     void await(cudaStream_t stream);
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;

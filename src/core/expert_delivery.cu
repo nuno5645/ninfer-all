@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -40,13 +41,28 @@ constexpr std::uint64_t kRoundFileBytes = 8ULL << 20;
 
 // needed[e] of a call: its pairs routed to expert e, and whether the table entry the split read
 // lies in the persistent cache.
-constexpr std::uint32_t kCountMask = (1u << 30) - 1;
+constexpr std::uint32_t kCountMask = (1u << 29) - 1;
 // Request flag: begin() received the family's CPU inputs, so the call may leave misses to the CPU.
 constexpr std::uint32_t kCpuCall = 1;
 constexpr std::uint32_t kHit     = 1u << 30;
 constexpr std::uint32_t kMiss    = 1u << 31;
-// The split's shared count of an expert whose table entry hits.
+// hp-tune (miss-skip): needed[e] of an expert the split dropped (its count reads zero).
+constexpr std::uint32_t kSkip    = 1u << 29;
+// The split's shared count of an expert whose table entry hits; with miss-skip, of a missing
+// expert one of whose pairs must stay (kKeep), and of an expert it drops (kDrop).
 constexpr std::uint32_t kInCache = 1u << 31;
+constexpr std::uint32_t kKeep    = 1u << 30;
+constexpr std::uint32_t kDrop    = 1u << 29;
+
+// hp-tune (miss-skip): the split's view of ExpertDelivery::Skip and the environment's limits.
+struct SplitSkip {
+    float* weights     = nullptr; // null: no miss-skip
+    const float* scale = nullptr;
+    int top_k          = 0;
+    int rank           = 1 << 30;
+    float share        = 0.0f;
+    int renorm         = 0;
+};
 
 std::uint64_t aligned(std::uint64_t n) {
     if (n > std::numeric_limits<std::uint64_t>::max() - 255) {
@@ -140,7 +156,7 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
                              std::int32_t* missing, std::int32_t* cached_experts,
                              std::int32_t* missing_experts, std::uint32_t* needed,
                              HostCopies copies, handshake::DeviceMailbox mailbox, std::uint32_t tag,
-                             std::uint32_t flags) {
+                             std::uint32_t flags, SplitSkip skip) {
     extern __shared__ std::uint32_t counts[];
     __shared__ std::uint32_t routes, sets[2][32], listed[2];
     if (threadIdx.x == 0) {
@@ -166,18 +182,55 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         return !wide && ((address >= lent_low[0] && address < lent_high[0]) ||
                          (address >= lent_low[1] && address < lent_high[1]));
     };
+    // hp-tune (miss-skip), narrow calls only: the hits first, then each missing pair whose rank in
+    // its row (by probability, 0 the largest) is below skip.rank and whose share of the row's
+    // probability is at least skip.share keeps its expert. Padding pairs (-1) count for nothing.
+    const bool skipping = skip.weights != nullptr && !wide;
+    const auto probability = [&](std::uint32_t j) {
+        const int x = ids[j];
+        if (x < 0 || x >= experts) { return 0.0f; }
+        return skip.scale ? skip.weights[j] / skip.scale[x] : skip.weights[j];
+    };
+    if (skipping) {
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+            if (counts[e] && hit(tables[e])) { counts[e] |= kInCache; }
+        }
+        __syncthreads();
+        for (std::uint32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
+            const int e = ids[p];
+            if (e < 0 || e >= experts || (counts[e] & kInCache)) { continue; }
+            const std::uint32_t base = p / std::uint32_t(skip.top_k) * std::uint32_t(skip.top_k);
+            const float w = probability(p);
+            float sum = 0.0f;
+            int rank  = 0;
+            for (std::uint32_t j = base; j < base + std::uint32_t(skip.top_k); ++j) {
+                const float v = probability(j);
+                sum += v;
+                if (j != p && (v > w || (v == w && j < p))) { ++rank; }
+            }
+            const bool drop = rank >= skip.rank || w < skip.share * sum;
+            if (!drop) { atomicOr(counts + e, kKeep); }
+        }
+        __syncthreads();
+    }
     // Each warp ballots its experts of a block-wide pass; earlier warps and passes place them.
     // A routed expert's count keeps its hit in the top bit for the pairs below.
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int first = 0; first < experts; first += blockDim.x) {
         const int e               = first + threadIdx.x;
         const std::uint32_t count = e < experts ? counts[e] : 0;
-        const bool in_cache       = count != 0 && hit(tables[e]);
+        const bool dropped = skipping && count != 0 && !(count & kInCache) && !(count & kKeep);
+        const bool routed  = count != 0 && !dropped;
+        const bool in_cache =
+            routed && (skipping ? (count & kInCache) != 0 : hit(tables[e]));
         const unsigned hits       = __ballot_sync(~0u, in_cache);
-        const unsigned misses     = __ballot_sync(~0u, count != 0 && !in_cache);
+        const unsigned misses     = __ballot_sync(~0u, routed && !in_cache);
         if (e < experts) {
-            needed[e] = count == 0 ? 0u : (count & kCountMask) | (in_cache ? kHit : kMiss);
+            needed[e] = dropped  ? kSkip
+                        : !routed ? 0u
+                                  : (count & kCountMask) | (in_cache ? kHit : kMiss);
             if (in_cache) { counts[e] = count | kInCache; }
+            if (dropped) { counts[e] = count | kDrop; }
         }
         if (lane == 0) {
             sets[0][warp] = __popc(hits);
@@ -190,7 +243,7 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
             at[1] += sets[1][w];
         }
         const unsigned below = (1u << lane) - 1;
-        if (count != 0) {
+        if (routed) {
             if (in_cache) {
                 cached_experts[1 + at[0] + __popc(hits & below)] = e;
             } else {
@@ -210,8 +263,37 @@ __global__ void split_routes(const std::int32_t* ids, std::uint32_t pairs, int e
         const int e            = ids[p];
         const bool valid       = e >= 0 && e < experts;
         const bool cached_pair = valid && (counts[e] & kInCache) != 0;
+        const bool dropped     = valid && (counts[e] & kDrop) != 0;
         cached[p]  = cached_pair ? e : -1;
-        missing[p] = valid && !cached_pair ? e : -1;
+        missing[p] = valid && !cached_pair && !dropped ? e : -1;
+    }
+    // hp-tune (miss-skip): a dropped pair weighs zero; with renorm the row's kept weights scale
+    // up to the row's probability. Before the copies, which carry the weights to the CPU.
+    if (skipping) {
+        const std::uint32_t k = std::uint32_t(skip.top_k);
+        for (std::uint32_t row = threadIdx.x; row < pairs / k; row += blockDim.x) {
+            float sum = 0.0f, kept = 0.0f;
+            bool any  = false;
+            for (std::uint32_t j = row * k; j < row * k + k; ++j) {
+                const int e = ids[j];
+                if (e < 0 || e >= experts) { continue; }
+                const float v = probability(j);
+                sum += v;
+                if (counts[e] & kDrop) {
+                    any = true;
+                } else {
+                    kept += v;
+                }
+            }
+            if (!any) { continue; }
+            const float factor = skip.renorm && kept > 0.0f ? sum / kept : 1.0f;
+            for (std::uint32_t j = row * k; j < row * k + k; ++j) {
+                const int e = ids[j];
+                if (e < 0 || e >= experts) { continue; }
+                skip.weights[j] = (counts[e] & kDrop) ? 0.0f : skip.weights[j] * factor;
+            }
+        }
+        __syncthreads();
     }
     // 16-byte words where both ends and the length allow, else 4-byte words or bytes: a warp's
     // writes into mapped memory cross the bus as fewer, wider writes.
@@ -338,6 +420,12 @@ struct ExpertDelivery::Impl {
     std::uint64_t loop_tokens = 0, loop_forced = 0;
     std::int64_t loop_visit = -1; // the served call's visit of its loop layer this token
     LoopCounts loop_counts[3];
+    // hp-tune (miss-skip): the environment's limits (skip.weights stays null) and, over narrow
+    // calls, the experts dropped, the misses before dropping and the routes before dropping;
+    // a narrow call to layer 0 starts a pass, reported every 256.
+    SplitSkip skip_limits;
+    bool skip_on = false;
+    std::uint64_t skip_passes = 0, skip_dropped = 0, skip_missing = 0, skip_routes = 0;
     std::vector<Pool> pools;
     // hp-tune (N6): per pool, its layers' profile routes, most first (empty: slots by layer).
     std::vector<std::vector<double>> pool_routes;
@@ -441,6 +529,29 @@ struct ExpertDelivery::Impl {
          std::vector<ExpertDeliveryLayer> specs, ExpertDeliveryOptions o)
         : rank(r), options(o) {
         DeviceBinding bind(rank.device);
+        // hp-tune (miss-skip): off unless a rank or a share is set.
+        if (const char* v = std::getenv("NINFER_MISS_SKIP_RANK"); v && *v) {
+            const long n = std::strtol(v, nullptr, 10);
+            if (n >= 1) {
+                skip_limits.rank = int(std::min(n, 1L << 30));
+                skip_on          = true;
+            }
+        }
+        if (const char* v = std::getenv("NINFER_MISS_SKIP_W"); v && *v) {
+            const float w = std::strtof(v, nullptr);
+            if (w > 0.0f && w < 1.0f) {
+                skip_limits.share = w;
+                skip_on           = true;
+            }
+        }
+        if (const char* v = std::getenv("NINFER_MISS_SKIP_RENORM"); v && *v && *v != '0') {
+            skip_limits.renorm = 1;
+        }
+        if (skip_on) {
+            std::fprintf(stderr, "hp-tune: miss-skip rank=%d w=%g renorm=%d\n",
+                         skip_limits.rank >= (1 << 30) ? -1 : skip_limits.rank,
+                         double(skip_limits.share), skip_limits.renorm);
+        }
         if (specs.empty() || options.pair_capacity == 0) {
             throw std::invalid_argument("expert delivery: layers and pair capacity are required");
         }
@@ -1831,9 +1942,11 @@ struct ExpertDelivery::Impl {
         std::uint32_t routes = 0;
         std::fill(call_routed.begin(), call_routed.end(), 0);
         std::fill(call_cpu.begin(), call_cpu.end(), 0);
+        std::uint32_t dropped = 0;
         for (int e = 0; e < experts; ++e) {
             const std::uint32_t count = needed[e] & kCountMask;
             call_count[std::size_t(e)] = count;
+            if (needed[e] & kSkip) { ++dropped; }
             if (!count) { continue; }
             ++routes;
             call_routed[std::size_t(e)] = 1;
@@ -1845,6 +1958,22 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        if (skip_on && !wide) {
+            // hp-tune (miss-skip): the dropped experts were misses and routes before the split.
+            if (li == 0 && ++skip_passes % 256 == 0) {
+                std::fprintf(stderr,
+                             "hp-tune: miss-skip after %llu passes: %llu dropped / %llu missing / "
+                             "%llu routes (%.1f%% of misses, %.2f%% of routes)\n",
+                             (unsigned long long)skip_passes, (unsigned long long)skip_dropped,
+                             (unsigned long long)skip_missing, (unsigned long long)skip_routes,
+                             100.0 * double(skip_dropped) / double(std::max<std::uint64_t>(skip_missing, 1)),
+                             100.0 * double(skip_dropped) / double(std::max<std::uint64_t>(skip_routes, 1)));
+            }
+            skip_dropped += dropped;
+            skip_routes += routes + dropped;
+            skip_missing += dropped;
+            for (int e = 0; e < experts; ++e) { skip_missing += (needed[e] & kMiss) ? 1 : 0; }
+        }
         land(!wide);
         ++stamp;
         for (int e = 0; e < experts; ++e) {
@@ -2247,7 +2376,7 @@ ExpertDelivery::~ExpertDelivery() = default;
 
 ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t* ids,
                                            std::uint32_t pairs, cudaStream_t stream,
-                                           std::span<const Input> inputs) {
+                                           std::span<const Input> inputs, Skip skip) {
     auto& p = *impl_;
     p.check();
     if (p.released) { throw std::logic_error("expert delivery: device backing is released"); }
@@ -2284,15 +2413,23 @@ ExpertDelivery::Call ExpertDelivery::begin(std::size_t index, const std::int32_t
         call.products = p.products.p;
         call.cpu = static_cast<const std::int32_t*>(p.cpu_flag.p);
     }
+    // hp-tune (miss-skip): only when enabled and the caller gave whole rows of weights.
+    SplitSkip split_skip = p.skip_limits;
+    if (p.skip_on && skip.weights && skip.top_k > 0 && pairs % std::uint32_t(skip.top_k) == 0) {
+        split_skip.weights = skip.weights;
+        split_skip.scale   = skip.scale;
+        split_skip.top_k   = skip.top_k;
+    }
     split_routes<<<1, 1024, std::size_t(experts) * 4, stream>>>(
         ids, pairs, experts, static_cast<const void* const*>(layer.tables.p), low,
         low + p.cache_span, static_cast<const std::uintptr_t*>(p.lent_ranges.p),
         static_cast<std::int32_t*>(p.cached_ids.p), static_cast<std::int32_t*>(p.missing_ids.p),
         p.cached_experts, p.missing_experts, static_cast<std::uint32_t*>(p.needed_mapped), copies,
-        p.handshake->device(), std::uint32_t(index), cpu ? kCpuCall : 0);
+        p.handshake->device(), std::uint32_t(index), cpu ? kCpuCall : 0, split_skip);
     CUDA_CHECK(cudaGetLastError());
     return call;
 }
+bool ExpertDelivery::miss_skip() const noexcept { return impl_->skip_on; }
 void ExpertDelivery::await(cudaStream_t stream) {
     impl_->handshake->wait_prepared(stream);
     impl_->check();

@@ -2076,6 +2076,7 @@ struct Executor::Impl {
         int first = 0;              // a prompt chunk's first position
         int kept  = 0;              // a prompt chunk's rows the sequence keeps
         bool keep = false;          // a decode or verification call keeps its rows' history
+        bool decode = false;        // hp-tune (miss-skip): a decode step (not a verification)
         int row_group = 1;          // a verification's rows a full visit's attention block takes
         kernels::Rows rows;
         States states;
@@ -2712,9 +2713,18 @@ struct Executor::Impl {
             const std::array<ExpertDelivery::Input, 2> inputs{
                 ExpertDelivery::Input{act, cpu ? cpu_experts->activation_bytes(t) : 0},
                 ExpertDelivery::Input{weights, cpu ? cpu_experts->weight_bytes(t) : 0}};
+            // hp-tune (miss-skip): a decode step's vector products only (the split's dropped
+            // experts leave both stages; never a prompt chunk or a verification).
+            ExpertDelivery::Skip skip;
+            if (vector && c.decode && !c.chunk && t <= 8 && delivery->miss_skip()) {
+                skip.weights = weights;
+                skip.scale   = p.down_scale;
+                skip.top_k   = k;
+            }
             call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
                                    cpu ? std::span<const ExpertDelivery::Input>(inputs)
-                                       : std::span<const ExpertDelivery::Input>());
+                                       : std::span<const ExpertDelivery::Input>(),
+                                   skip);
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
@@ -3010,6 +3020,7 @@ struct Executor::Impl {
         c.row_group      = row_group;
         c.q8             = !bf16_rows;
         c.keep           = true;
+        c.decode         = keep;
         c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
         c.rows.sequences = static_cast<const std::int32_t*>(d_sequences.p);
         c.rows.tokens    = b;

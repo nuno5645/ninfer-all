@@ -7,14 +7,12 @@ permissions:
   contents: read
 jobs:
   linux:
-    # hp-tune (N13): the plain build and one whose GGUF CPU expert products target Zen 2
-    # (Ryzen 5 3500); both start from the same ccache, only those two files differ.
+    # hp-tune: the plain build only (the znver2 CPU-expert variant, N13, is no longer built).
     strategy:
       fail-fast: false
       matrix:
         include:
           - { name: ninfer-hp-sm75, march: "" }
-          - { name: ninfer-hp-sm75-znver2, march: znver2 }
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     container:
