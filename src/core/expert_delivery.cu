@@ -326,11 +326,18 @@ struct ExpertDelivery::Impl {
     // bank region offset/size and the zero tail kept after a bank run.
     std::vector<std::uint64_t> slot_offset, slot_size, bank_offset, bank_size, tail;
     std::uint64_t slot_bytes = 0, bank_bytes = 0;
-    // hp-tune (N12): this token's narrow visits per layer, the tokens seen, the served call's
-    // visit of its loop layer this token, and lent slots taken from guarded experts.
+    // hp-tune (N11/N12): this token's narrow visits per layer, each loop layer's experts that its
+    // last visit routed, the tokens seen, and the pass-to-pass counts by transition (1->2, 2->3).
+    struct LoopCounts {
+        std::uint64_t visits = 0, routes = 0, previous = 0, repeat = 0, repeat_cache = 0,
+                      repeat_lent = 0, repeat_cpu = 0, repeat_copied = 0, fresh_cpu = 0,
+                      fresh_copied = 0;
+    };
     std::vector<std::uint32_t> loop_visits;
+    std::vector<std::vector<unsigned char>> loop_prev;
     std::uint64_t loop_tokens = 0, loop_forced = 0;
-    std::int64_t loop_visit = -1;
+    std::int64_t loop_visit = -1; // the served call's visit of its loop layer this token
+    LoopCounts loop_counts[3];
     std::vector<Pool> pools;
     // hp-tune (N6): per pool, its layers' profile routes, most first (empty: slots by layer).
     std::vector<std::vector<double>> pool_routes;
@@ -769,9 +776,10 @@ struct ExpertDelivery::Impl {
                          line.c_str());
         }
         loop_visits.assign(layers.size(), 0);
+        loop_prev.assign(layers.size(), std::vector<unsigned char>(max_experts, 0));
         if (options.loop_passes < 2 || options.loop_first >= options.loop_end ||
             options.loop_end > layers.size()) {
-            options.loop_belady = false;
+            options.loop_belady = options.loop_stats = false;
         }
         call_routed.assign(max_experts, 0);
         call_cpu.assign(max_experts, 0);
@@ -1413,25 +1421,26 @@ struct ExpertDelivery::Impl {
         }
     }
 
-    // hp-tune (N12): before a call's misses are placed. A wide call ends the token's guards;
+    // hp-tune (N11/N12): before a call's misses are placed. A wide call ends the token's guards;
     // a narrow one may start a token, and at a loop layer it moves the layer's guards to the
     // experts it routes when the token visits the layer again.
     void loop_begin(std::size_t li, bool wide) {
         loop_visit = -1;
-        if (!options.loop_belady) { return; }
+        if (!options.loop_belady && !options.loop_stats) { return; }
         if (wide) {
-            tier->clear_guards();
+            if (options.loop_belady) { tier->clear_guards(); }
             std::fill(loop_visits.begin(), loop_visits.end(), 0);
             return;
         }
         if (last_narrow < 0 ||
             (std::int64_t(li) < last_narrow && li < std::size_t(options.loop_first))) {
-            tier->clear_guards();
+            if (options.loop_belady) { tier->clear_guards(); }
             std::fill(loop_visits.begin(), loop_visits.end(), 0);
             if (++loop_tokens % 256 == 0) { loop_report(); }
         }
         if (li < options.loop_first || li >= options.loop_end) { return; }
         loop_visit = std::int64_t(loop_visits[li]++);
+        if (!options.loop_belady) { return; }
         const auto n = std::int32_t(layers[li].source.experts.size());
         const bool again = std::uint32_t(loop_visit) + 1 < options.loop_passes;
         for (std::int32_t e = 0; e < n; ++e) {
@@ -1439,7 +1448,56 @@ struct ExpertDelivery::Impl {
         }
     }
 
+    // hp-tune (N11): after a loop layer's misses are placed: what its pass shares with the pass
+    // before, and where those experts were.
+    void loop_end_call(std::size_t li, const std::uint32_t* needed) {
+        if (loop_visit < 0) { return; }
+        auto& prev = loop_prev[li];
+        const auto n = layers[li].source.experts.size();
+        if (options.loop_stats && loop_visit >= 1) {
+            auto& c = loop_counts[std::min<std::int64_t>(loop_visit - 1, 2)];
+            ++c.visits;
+            for (std::size_t e = 0; e < n; ++e) {
+                c.previous += prev[e];
+                if (!call_routed[e]) { continue; }
+                ++c.routes;
+                const bool hit = (needed[e] & kHit) != 0;
+                if (prev[e]) {
+                    ++c.repeat;
+                    if (hit) {
+                        ++(layers[li].lent_of[e] >= 0 ? c.repeat_lent : c.repeat_cache);
+                    } else {
+                        ++(call_cpu[e] ? c.repeat_cpu : c.repeat_copied);
+                    }
+                } else if (!hit) {
+                    ++(call_cpu[e] ? c.fresh_cpu : c.fresh_copied);
+                }
+            }
+        }
+        for (std::size_t e = 0; e < n; ++e) { prev[e] = call_routed[e]; }
+    }
+
     void loop_report() const {
+        if (options.loop_stats) {
+            for (std::uint32_t t = 0; t + 1 < std::min<std::uint32_t>(options.loop_passes, 4); ++t) {
+                const auto& c = loop_counts[t];
+                if (c.visits == 0) { continue; }
+                const double r = double(std::max<std::uint64_t>(c.repeat, 1));
+                std::fprintf(stderr,
+                             "hp-tune: N11 loop pass %u->%u after %llu tokens: %.2f routes/visit, "
+                             "%.1f%% routed by the pass before (%.2f/visit): of those %.1f%% "
+                             "cache, %.1f%% lent, %.1f%% CPU, %.1f%% copied; new experts per "
+                             "visit: %.2f CPU, %.2f copied\n",
+                             t + 1, t + 2, (unsigned long long)loop_tokens,
+                             double(c.routes) / double(c.visits),
+                             100.0 * double(c.repeat) / double(std::max<std::uint64_t>(c.routes, 1)),
+                             double(c.repeat) / double(c.visits), 100.0 * double(c.repeat_cache) / r,
+                             100.0 * double(c.repeat_lent) / r, 100.0 * double(c.repeat_cpu) / r,
+                             100.0 * double(c.repeat_copied) / r,
+                             double(c.fresh_cpu) / double(c.visits),
+                             double(c.fresh_copied) / double(c.visits));
+            }
+        }
         if (options.loop_belady) {
             std::fprintf(stderr,
                          "hp-tune: N12 after %llu tokens: %llu guarded admission victims passed "
@@ -1801,7 +1859,7 @@ struct ExpertDelivery::Impl {
         previous_layer = std::int64_t(li);
         previous_wide  = wide;
         const bool new_pass = !wide && last_narrow >= 0 && std::int64_t(li) < last_narrow;
-        loop_begin(li, wide); // hp-tune (N12)
+        loop_begin(li, wide); // hp-tune (N11/N12)
         if (wide) { quiet_passes = 0; }
         if (per_bank && new_pass && ++quiet_passes >= 2) {
             // Only narrow calls ran for two passes: the banks become cache slots.
@@ -1867,6 +1925,7 @@ struct ExpertDelivery::Impl {
             }
             to_bank.push_back(e);
         }
+        loop_end_call(li, needed); // hp-tune (N11)
         // The tier learns from decode and verification only; a call below the last narrow one
         // starts a pass (a draft layer's repeated calls do not). It learns once the call's copies
         // are issued, so a pass's round does not hold them back; the call's tables, uploaded

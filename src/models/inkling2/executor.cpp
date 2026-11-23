@@ -1370,17 +1370,18 @@ struct Executor::Impl {
             std::fprintf(stderr, "hp-tune: N6 slots by weight: loop layers route %.2fx the others "
                                  "a layer in the profile, weighted x%.0f\n", ratio, times);
         }
-        // hp-tune (N12): the loop's layers for the delivery's per-token pass tracking.
+        // hp-tune (N11/N12): the loop's layers for the delivery's per-token pass tracking.
         if (config.num_passes > 1) {
             transport.loop_first  = config.core_start;
             transport.loop_end    = config.core_end;
             transport.loop_passes = config.num_passes;
             transport.loop_belady = env_flag("NINFER_LOOP_BELADY");
+            transport.loop_stats  = env_flag("NINFER_LOOP_STATS");
         }
         std::fprintf(stderr, "hp-tune: knobs NINFER_SLOTS_BY_WEIGHT=%d NINFER_LOOP_BELADY=%d "
-                             "(loop layers %u-%u x%u)\n",
+                             "NINFER_LOOP_STATS=%d (loop layers %u-%u x%u)\n",
                      int(!transport.slot_weights.empty()), int(transport.loop_belady),
-                     unsigned(transport.loop_first),
+                     int(transport.loop_stats), unsigned(transport.loop_first),
                      unsigned(transport.loop_end) - 1, unsigned(transport.loop_passes));
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
