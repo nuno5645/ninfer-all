@@ -288,16 +288,30 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     // sliding-window rings (window + chunk). A device without room for that chunk's workspace takes
     // the widest of 1024 and 512 that fits.
     // hp-tune: NINFER_INK_CHUNK=N (a multiple of 128) starts the fallback at N instead of 2048.
+    // hp-tune (N7): NINFER_INK_ELASTIC=1 with NINFER_INK_PREFILL_CHUNK=P (a multiple of 128, up
+    // to 4096) runs prompt chunks of P with a workspace the elastic expert cache lends them, the
+    // resident workspace staying at the chunk N (the decode's; 256 at least with the elastic
+    // workspace, 512 without).
+    std::uint32_t wide_chunk = 0;
+    if (const char* e = std::getenv("NINFER_INK_ELASTIC"); e != nullptr && std::atoi(e) == 1) {
+        if (const char* n = std::getenv("NINFER_INK_PREFILL_CHUNK"); n != nullptr && std::atoi(n) >= 128) {
+            wide_chunk = std::min<std::uint32_t>(std::uint32_t(std::atoi(n)) / 128u * 128u, 4096u);
+        }
+        std::fprintf(stderr, "hp-tune: elastic workspace requested, prompt chunks of %u\n",
+                     unsigned(wide_chunk));
+    }
     std::vector<std::uint32_t> chunks{2048u, 1024u, 512u};
     if (const char* e = std::getenv("NINFER_INK_CHUNK"); e != nullptr && std::atoi(e) >= 128) {
         const auto c = std::uint32_t(std::atoi(e)) / 128u * 128u;
         chunks.clear();
         for (std::uint32_t x = c; x >= 512u; x /= 2u) { chunks.push_back(x / 128u * 128u); }
-        if (chunks.empty() || chunks.back() != 512u) { chunks.push_back(512u); }
+        if (wide_chunk > c && c >= 256u && c < 512u) { chunks.push_back(c); }
+        if (chunks.empty() || chunks.back() > 512u) { chunks.push_back(512u); }
         std::fprintf(stderr, "hp-tune: Inkling 2 prompt chunk %u\n", unsigned(chunks.front()));
     }
     for (const std::uint32_t chunk : chunks) {
-        executor.prefill_chunk = chunk;
+        executor.prefill_chunk   = wide_chunk > chunk ? wide_chunk : chunk;
+        executor.workspace_chunk = wide_chunk > chunk ? chunk : 0;
         try {
             instance->executor =
                 std::make_unique<models::inkling2::Executor>(*model, device, executor);

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -283,6 +284,17 @@ struct Executor::Impl {
     DeviceBuffer logits_bf16;
     std::unique_ptr<WorkspaceArena> workspace;
     std::size_t workspace_bytes = 0;
+    // hp-tune (N7): the elastic workspace. ws_chunk is the chunk the resident workspace is planned
+    // for (prefill_chunk unless elastic). Elastic: ws_region reserves a prefill_chunk workspace
+    // (ws_full bytes) whose first ws_head bytes stay mapped; `workspace` is the arena over the
+    // head, `workspace_wide` the one over the whole region, and the two swap while the tail is
+    // mapped (`wide`): from a prompt chunk wider than ws_chunk to the next decode or verification.
+    // Decode graphs address the head only.
+    std::uint32_t ws_chunk = 0;
+    bool elastic = false, wide = false;
+    GrowableRegion ws_region;
+    std::unique_ptr<WorkspaceArena> workspace_wide;
+    std::size_t ws_head = 0, ws_full = 0;
     std::uint64_t kv_bytes      = 0;
     int decode_splits_full = 1, decode_splits_sliding = 1;
     std::map<std::uint32_t, GraphEntry> graphs;
@@ -333,6 +345,23 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 executor: drafts beyond the histories");
         }
         options.prefill_chunk = std::min<std::uint32_t>(options.prefill_chunk, 4096);
+        ws_chunk              = options.prefill_chunk;
+        if (options.workspace_chunk != 0 && options.workspace_chunk < options.prefill_chunk) {
+            const char* why = !growing                       ? "no elastic expert cache"
+                              : options.dspark               ? "DSpark"
+                              : options.vision_max_patches   ? "vision"
+                              : model.expert_parallel()      ? "expert parallelism"
+                                                             : nullptr;
+            if (why == nullptr) {
+                elastic  = true;
+                ws_chunk = options.workspace_chunk;
+            } else {
+                std::fprintf(stderr, "hp-tune: elastic workspace off (%s): prompt chunks of %u\n",
+                             why, unsigned(options.workspace_chunk));
+                options.prefill_chunk = options.workspace_chunk;
+                ws_chunk              = options.prefill_chunk;
+            }
+        }
         // A verification writes a round's drafts past the window before keeping only some, and
         // rewind() goes back as far as the histories allow (kR less the taps and the drafts): the
         // ring holds the window and kR slots beyond it, no more, since 40 visits keep one each.
@@ -519,11 +548,29 @@ struct Executor::Impl {
         }
         kv_backed       = kv_fixed;
         if (options.vision_max_patches > 0) { plan_vision(); }
-        workspace_bytes = plan_workspace();
+        workspace_bytes = plan_workspace(ws_chunk);
         if (tower) { workspace_bytes = std::max(workspace_bytes, tower->workspace_bytes()); }
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            if (elastic) {
+                // The wide workspace must fit where a fixed prefill_chunk workspace would (beside
+                // every growing cache's whole reservation); else the prompt chunks stay ws_chunk.
+                const std::size_t g = vmm::granularity(device_id);
+                ws_head = round_up(workspace_bytes, g);
+                ws_full = round_up(plan_workspace(options.prefill_chunk), g);
+                if (ws_full <= ws_head || ws_full + kGraphReserve + unbacked() > free_bytes) {
+                    std::fprintf(stderr,
+                                 "hp-tune: elastic workspace off (%zu MiB for chunks of %u do not "
+                                 "fit in %zu MiB free): prompt chunks of %u\n",
+                                 ws_full >> 20, unsigned(options.prefill_chunk), free_bytes >> 20,
+                                 unsigned(ws_chunk));
+                    elastic               = false;
+                    options.prefill_chunk = ws_chunk;
+                } else {
+                    workspace_bytes = ws_head;
+                }
+            }
             if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the workspace of " + std::to_string(workspace_bytes >> 20) +
@@ -534,7 +581,23 @@ struct Executor::Impl {
                     "prompt chunk");
             }
         }
-        workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        if (elastic) {
+            ws_region = GrowableRegion(ws_full, {.device = device_id});
+            if (!ws_region.map(0, ws_head)) {
+                throw InsufficientMemory("Inkling 2: no device memory for the workspace of " +
+                                         std::to_string(ws_head >> 20) + " MiB");
+            }
+            workspace      = std::make_unique<WorkspaceArena>(DeviceSpan{ws_region.data(), ws_head});
+            workspace_wide = std::make_unique<WorkspaceArena>(DeviceSpan{ws_region.data(), ws_full});
+            std::fprintf(stderr,
+                         "hp-tune: elastic workspace: %zu MiB resident (decode, chunks up to %u), "
+                         "%zu MiB for prompt chunks of %u (the %zu MiB between borrowed from the "
+                         "expert cache)\n",
+                         ws_head >> 20, unsigned(ws_chunk), ws_full >> 20,
+                         unsigned(options.prefill_chunk), (ws_full - ws_head) >> 20);
+        } else {
+            workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        }
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
@@ -1404,8 +1467,62 @@ struct Executor::Impl {
     }
 
     std::size_t start_reserve() const {
-        return options.prefill_chunk >= kFullChunk ? std::size_t(1536) << 20
-                                                   : std::size_t(512) << 20;
+        return ws_chunk >= kFullChunk ? std::size_t(1536) << 20
+                                      : std::size_t(512) << 20;
+    }
+
+    // hp-tune (N7): before a prompt chunk of t tokens, the wide workspace when t passes the
+    // resident one's chunk: the cache gives back what the tail needs beside the graph reserve,
+    // as back() does for the KV caches. False when the device cannot supply it (the cache keeps
+    // what it gave). Outside capture.
+    [[nodiscard]] bool widen(int t) {
+        if (!elastic || wide || std::uint32_t(t) <= ws_chunk) { return true; }
+        const auto t0 = std::chrono::steady_clock::now();
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        const std::size_t need = ws_region.unmapped_bytes(ws_head, ws_full - ws_head);
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const auto no_room = [&] {
+            std::fprintf(stderr, "hp-tune: elastic workspace: no room for the %zu MiB tail; "
+                                 "prompt chunks of %u\n", need >> 20, unsigned(ws_chunk));
+            return false;
+        };
+        // Whole cache and free memory short of the tail: leave the cache as it is.
+        if (free + delivery->memory().cache_bytes < need + (std::size_t(32) << 20)) { return no_room(); }
+        std::uint64_t shrunk = 0;
+        if (free < need + kGraphReserve) { shrunk += delivery->shrink_cache(need + kGraphReserve - free); }
+        while (!ws_region.map(ws_head, ws_full - ws_head)) {
+            const std::uint64_t s = delivery->shrink_cache(std::max(need, std::size_t(64) << 20));
+            if (s == 0) {
+                delivery->grow_cache();
+                return no_room();
+            }
+            shrunk += s;
+        }
+        std::swap(workspace, workspace_wide);
+        wide = true;
+        const auto m = delivery->memory();
+        std::fprintf(stderr, "hp-tune: elastic widen: +%zu MiB workspace, cache -%llu MiB -> %u "
+                             "slots, %.1f ms\n", need >> 20, (unsigned long long)(shrunk >> 20),
+                     unsigned(m.cache_slots),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return true;
+    }
+
+    // hp-tune (N7): before a decode or verification, the tail goes back to the expert cache (its
+    // new slots start empty and fill as misses and tier rounds bring experts).
+    void narrow() {
+        if (!wide) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        std::swap(workspace, workspace_wide);
+        wide = false;
+        ws_region.unmap(ws_head, ws_full - ws_head);
+        const std::uint64_t grown = delivery->grow_cache();
+        const auto m = delivery->memory();
+        std::fprintf(stderr, "hp-tune: elastic narrow: cache +%llu MiB -> %u slots, %.1f ms\n",
+                     (unsigned long long)(grown >> 20), unsigned(m.cache_slots),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
 
     ~Impl() {
@@ -1436,8 +1553,7 @@ struct Executor::Impl {
         return round_up(gguf::vector_activation_bytes(k, t), kAlign);
     }
 
-    std::size_t plan_workspace() const {
-        const std::size_t t = options.prefill_chunk;
+    std::size_t plan_workspace(std::size_t t) const {
         const std::size_t h = hidden;
         const std::size_t q_floats = std::size_t(query_heads) * kD;
         const std::size_t width    = config.moe_intermediate_size;
@@ -2658,6 +2774,21 @@ struct Executor::Impl {
         if (first + std::uint32_t(t) > options.max_context) {
             throw std::invalid_argument("inkling2 forward: context capacity exceeded");
         }
+        if (!widen(t)) {
+            // hp-tune (N7): no room for the wide workspace: the chunk runs as chunks of the
+            // resident workspace's width, the last one whole and with the logits.
+            if (branching || !images.empty()) {
+                throw InsufficientMemory("Inkling 2: no device memory for the wide workspace");
+            }
+            const int last = std::min<int>(t, int(ws_chunk));
+            for (int at = 0; at < t - last; at += int(ws_chunk)) {
+                forward(sequence, tokens.subspan(std::size_t(at),
+                                                 std::size_t(std::min<int>(int(ws_chunk), t - last - at))),
+                        0);
+            }
+            forward(sequence, tokens.subspan(std::size_t(t - last)), logit_rows);
+            return;
+        }
         back(sequence, first + std::uint32_t(t));
         std::vector<std::int32_t> pos(t), starts;
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
@@ -2839,6 +2970,7 @@ struct Executor::Impl {
             pos[i] = std::int32_t(positions[sequences[i]]);
             seq[i] = std::int32_t(sequences[i]);
         }
+        narrow();
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1); }
         stage(tokens, pos, seq);
         run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
@@ -2882,6 +3014,7 @@ struct Executor::Impl {
                 seq[at] = std::int32_t(s);
             }
         }
+        narrow();
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
         // A full visit's attention reads each key tile once for up to four rows of a sequence.
@@ -2984,6 +3117,16 @@ struct Executor::Impl {
             delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
+        }
+        if (options.workspace_chunk != 0) {
+            const auto m = delivery ? delivery->memory() : ExpertDeliveryMemory{};
+            std::fprintf(stderr,
+                         "hp-tune: N7 %s: prefill chunk %u (workspace %zu MiB), decode workspace "
+                         "%zu MiB (chunks up to %u), decode cache %llu MiB (%u slots)\n",
+                         elastic ? "elastic" : "off", unsigned(options.prefill_chunk),
+                         (elastic ? ws_full : workspace_bytes) >> 20, workspace_bytes >> 20,
+                         unsigned(ws_chunk), (unsigned long long)(m.cache_bytes >> 20),
+                         unsigned(m.cache_slots));
         }
     }
 

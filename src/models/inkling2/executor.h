@@ -80,6 +80,11 @@ struct ExecutorOptions {
     std::uint32_t expert_cpu_threads = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads expert_disk{};
+    // hp-tune (N7, elastic workspace): nonzero and below prefill_chunk, the resident workspace is
+    // planned for chunks of this many tokens (decode, short chunks); a wider prompt chunk maps the
+    // rest of a prefill_chunk workspace on demand from the elastic expert cache, and the next
+    // decode or verification gives it back. 0: one workspace for prefill_chunk (upstream).
+    std::uint32_t workspace_chunk = 0;
 };
 
 struct ExecutorMemory {
