@@ -15,6 +15,9 @@ jobs:
     defaults: { run: { shell: bash } }
     env:
       DEBIAN_FRONTEND: noninteractive
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 4G
+      CCACHE_COMPILERCHECK: content
       CUDA_VERSION: 12.9.2
       ARCHS: "75"
       LANG: C.UTF-8
@@ -22,9 +25,14 @@ jobs:
     steps:
       - name: Free disk
         run: rm -rf /host-tools/*/* || true; df -h /__w
-      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      - run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git ccache zstd
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-sm75-${{ github.sha }}
+          restore-keys: ccache-sm75-
       - name: Toolkit
         run: .github/scripts/install-linux-release-tools.sh
       - name: Configure
@@ -33,13 +41,14 @@ jobs:
           scripts/fetch-media-sources.sh
           cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_SHARED_RUNTIME=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
             -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON -DNINFER_WEBUI_DIR="$webui"
       - name: Build
         run: cmake --build build-release -j "$(nproc)" --target ninfer-serve ninfer-calibrate ninfer_bench
       - name: Collect
         run: |
           mkdir -p out
-          find build-release -maxdepth 3 -type f \( -name 'ninfer-serve' -o -name 'ninfer-calibrate' -o -name 'ninfer_bench' -o -name 'libninfer-runtime.so*' \) -exec cp -v {} out/ \;
-          git rev-parse HEAD > out/REV; ls -la out
+          cp -a build-release/portable/. out/
+          git rev-parse HEAD > out/REV; find out -maxdepth 3 -type f | head -40; ccache -s | tail -5
       - uses: actions/upload-artifact@v4
         with: { name: ninfer-hp-sm75, path: out/, retention-days: 7 }
