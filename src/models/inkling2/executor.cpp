@@ -554,12 +554,12 @@ struct Executor::Impl {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             if (elastic) {
-                // The wide workspace must fit where a fixed prefill_chunk workspace would (beside
-                // every growing cache's whole reservation); else the prompt chunks stay ws_chunk.
+                // The wide workspace must fit in the free memory with empty growing caches; as
+                // they grow, widen() finds whether it still does (else chunks of ws_chunk).
                 const std::size_t g = vmm::granularity(device_id);
                 ws_head = round_up(workspace_bytes, g);
                 ws_full = round_up(plan_workspace(options.prefill_chunk), g);
-                if (ws_full <= ws_head || ws_full + kGraphReserve + unbacked() > free_bytes) {
+                if (ws_full <= ws_head || ws_full + kGraphReserve > free_bytes) {
                     std::fprintf(stderr,
                                  "hp-tune: elastic workspace off (%zu MiB for chunks of %u do not "
                                  "fit in %zu MiB free): prompt chunks of %u\n",
@@ -1488,7 +1488,7 @@ struct Executor::Impl {
             return false;
         };
         // Whole cache and free memory short of the tail: leave the cache as it is.
-        if (free + delivery->memory().cache_bytes < need + (std::size_t(32) << 20)) { return no_room(); }
+        if (free + delivery->memory().cache_bytes < need + (std::size_t(64) << 20)) { return no_room(); }
         std::uint64_t shrunk = 0;
         if (free < need + kGraphReserve) { shrunk += delivery->shrink_cache(need + kGraphReserve - free); }
         while (!ws_region.map(ws_head, ws_full - ws_head)) {
