@@ -24,6 +24,7 @@
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda_fp16.h>
 
@@ -1379,10 +1380,11 @@ struct Executor::Impl {
             transport.loop_stats  = env_flag("NINFER_LOOP_STATS");
         }
         std::fprintf(stderr, "hp-tune: knobs NINFER_SLOTS_BY_WEIGHT=%d NINFER_LOOP_BELADY=%d "
-                             "NINFER_LOOP_STATS=%d (loop layers %u-%u x%u)\n",
+                             "NINFER_LOOP_STATS=%d (loop layers %u-%u x%u) cpu-march=%s\n",
                      int(!transport.slot_weights.empty()), int(transport.loop_belady),
                      int(transport.loop_stats), unsigned(transport.loop_first),
-                     unsigned(transport.loop_end) - 1, unsigned(transport.loop_passes));
+                     unsigned(transport.loop_end) - 1, unsigned(transport.loop_passes),
+                     ops::gguf_cpu_build_march());
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
         // Where a device's copies queue behind one another whatever their streams

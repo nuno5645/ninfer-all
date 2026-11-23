@@ -39,6 +39,8 @@ namespace ninfer::ops {
 enum class GgufCpuBackend { Automatic, Scalar, Avx2 };
 [[nodiscard]] bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept;
 [[nodiscard]] const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept;
+// hp-tune (N13): the -march these products were built for (NINFER_CPU_EXPERT_MARCH), or "generic".
+[[nodiscard]] const char* gguf_cpu_build_march() noexcept;
 [[nodiscard]] GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept;
 // Whether `format` has a CPU product here.
 [[nodiscard]] bool gguf_cpu_supported(QType format) noexcept;

@@ -126,5 +126,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512dq;-mf16c;-mfma"
       COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    # hp-tune (N13): NINFER_CPU_EXPERT_MARCH=znver2 (say) tunes only the GGUF CPU expert products
+    # for one CPU. -ffp-contract=off stays, so they keep the GPU's bits; the binary then needs
+    # that CPU (or a superset).
+    set(NINFER_CPU_EXPERT_MARCH "" CACHE STRING "hp-tune: -march for the GGUF CPU expert products")
+    if(NINFER_CPU_EXPERT_MARCH)
+      set_property(SOURCE "${cpu_expert_dir}/gguf_expert_cpu.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+        APPEND PROPERTY COMPILE_OPTIONS "-march=${NINFER_CPU_EXPERT_MARCH};-mtune=${NINFER_CPU_EXPERT_MARCH}")
+      message(STATUS "hp-tune: GGUF CPU expert products for -march=${NINFER_CPU_EXPERT_MARCH}")
+    endif()
   endif()
 endif()

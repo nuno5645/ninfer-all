@@ -502,6 +502,18 @@ const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept {
     return gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2 ? "avx2" : "scalar";
 }
 
+const char* gguf_cpu_build_march() noexcept {
+#if defined(__znver2__)
+    return "znver2";
+#elif defined(__znver3__)
+    return "znver3";
+#elif defined(__znver1__)
+    return "znver1";
+#else
+    return "generic";
+#endif
+}
+
 GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept {
     if (requested != GgufCpuBackend::Automatic) { return requested; }
     if (cpu_has_avx2()) { return GgufCpuBackend::Avx2; }
