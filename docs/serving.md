@@ -503,6 +503,71 @@ state advances only with Engine output commit, and is never restored from a prom
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
 
+### Banned words
+
+`bad_words` (vLLM's field) lists strings that the generated text never contains. Chat Completions,
+`/v1/completions`, `/completion`, `/v1/responses` and `/v1/messages` accept it:
+
+```json
+{
+  "model": "your-model-id",
+  "messages": [{"role": "user", "content": "Answer the last message."}],
+  "bad_words": ["<message", "<daily_persona", "<think"]
+}
+```
+
+The text is the bytes of the generated tokens in order, reasoning and tool-call text included. A
+token that the tokenizer marks special (a turn, channel or tool-call marker) has no text and
+separates the text around it, so a string cannot span it. A string is banned whatever tokens would
+write it, and so in every token sequence that vLLM bans for it (its own tokenization and the one
+after a space), and also inside a longer word (`<text` inside `<textarea`). Matching is
+case-sensitive. Bans apply from the first generated token; the prompt does not count.
+
+The field is an array of at most 128 distinct non-empty strings of at most 256 bytes; each string
+loses its leading spaces, tabs and line breaks, as in vLLM, and duplicates count once. A malformed
+field fails with HTTP 400 `invalid_bad_words`. The bans use the structured-output token masks,
+so they need `--structured-output`; without it a request with `bad_words` fails with HTTP 400
+`bad_words_not_supported`. They combine with a response format or strict tools in one mask per
+position; a position where nothing is left fails the request.
+
+A reply does not write the start of a banned string and then turn away from it. From the token where
+text that can still become a banned string begins (the hold), the request holds its output back and
+keeps what it needs to return there: the sequence's state before that token and the logits that drew
+it. When the text can no longer become a string, the held output is published. When that text dies
+and later text that can become a string begins in the same round (one token, or the several a
+speculative round verifies), the hold moves there and the output before it is published. When a
+token completes a string, the request goes back: it drops the hold's token and every token after it,
+returns the sequence to its state before them, and draws the hold's position again from the kept
+logits with the dropped token banned there. A string that begins and completes in one round goes
+back to its own first token there. A string whose start overlaps a longer start that began in an
+earlier round (`<<x` written as `<<<x`, one byte a round) goes back to that earlier start. The
+output never holds the dropped tokens; a stream receives held text when its hold ends, so a string's
+first tokens delay the stream. Logprobs follow the published tokens. The masks of every round ban
+the tokens that hold a whole string and the tokens a rewind banned at that position.
+
+A request rewinds at most 32 times and bans at most 8 tokens at one position. Past either limit,
+and where a family cannot reach back to the hold (below), each round's masks keep out every token
+that would complete a string instead: the model may then write most of a string before the ban
+stops it, and it continues with another token. How each family goes back:
+
+| Family | Going back | Reach and cost |
+|---|---|---|
+| Qwen3.5, 3.6 and 3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) | The request's sequence ends and the request queues again at the head of the queue: its prompt is the submitted one followed by the generated tokens it keeps, and its first draw is the rewound position. | Any distance. The context cache resumes the new prompt from the deepest state it holds: one token short of its end when the hold began in the round that completed the string, after that round's first token (a speculative round); otherwise a state at or before the submitted prompt's end, so the generated tokens up to the hold run again as prompt tokens (each requeue asks the cache for a resume point at its own prompt's end, for a later rewind). Without the context cache, or for a prompt that may not be reused, the whole prompt runs again. The result's timings add up every sequence's prefill and decode. |
+| Qwen3.8-Flash-Next and Edge0 | The recurrent state is copied when the hold begins, into the snapshot a stop string's hold uses, and restored; attention rows are kept by position. | Any distance. The snapshot takes 74 MiB a sequence, which `--structured-output` allocates also without the context cache. A hold that begins inside a speculative round ends that round's commit at the hold's token, and the tokens after it run in the next step. While a hold is alive a stop string keeps no state of its own, so a turn it cuts there leaves no resume point at the cut. |
+| Gemma 4 | The windowed blocks' rings keep rows past the window; full-attention rows are kept by position. No state is copied. | With drafts (`--spec mtp` or `dspine`; rings of 1280 rows for a window of 1024), 256 positions less a round's drafts; without drafts, the 32 decode steps after the hold begins, whose overwritten rows a hold keeps. |
+| Flint | The rings keep 768 positions for a window of 513; full-attention rows are kept by position. No state is copied. | 255 positions less a round's drafts. |
+| DeepSeek-V4.1 | The window rings and compressor tails are copied when the hold begins and restored; compressed rows are kept by position. | Any distance. With `--structured-output` and the context cache off, the copies take two more copies of each sequence's window rings (5.3 MiB each), as the context cache's checkpoints do. A hold that begins inside a speculative round is copied as the round commits, with no extra pass. |
+| Inkling 2 | The rings and the convolution and recurrent-head histories keep the last 32 positions. No state is copied. | 29 positions less a round's drafts. |
+
+The kept logits take one BF16 row of the vocabulary a sequence (0.5 MiB for Gemma 4). Bans hold at
+every speculative position: each column of a verification round masks after the drafts before it,
+so a draft with a banned token is rejected, and a draft that completes a string is accepted and
+then taken back with the rest of the hold. Drafts are proposed without the bans. A request with
+only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context lookup): its masks
+take microseconds and fill on the engine thread with no mask thread. The first request with a new
+list builds the list's filter (an Aho-Corasick automaton of the strings and the vocabulary's tokens
+by their bytes); the last eight lists are kept.
+
 ## Stop the server
 
 Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom
@@ -605,6 +670,7 @@ off.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/answer_now` | end a running reply's thinking now; the reply answers in the same response (see [Answer now](#answer-now)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -1071,6 +1137,8 @@ The endpoint supports:
   it first. Caller stop strings still apply; any other value type is rejected with 400. Output past
   the model's natural end is not meaningful text. `/v1/responses` and `/v1/messages` do not
   honor it;
+- vLLM's `bad_words`, strings that the reply never contains, with `--structured-output` (see
+  [Banned words](#banned-words));
 - `n:1` and text-only `modalities`;
 - `response_format` of type `text`, `json_object`, or `json_schema` (`name`, optional
   `description`, `schema` and `strict`), and the vLLM and llama.cpp constraint fields
@@ -1316,6 +1384,28 @@ because every pass varies a little.
   `reasoning_loop_thinking_tokens`, `reasoning_loop_coverage`) record each firing; `server_start`
   records the mode as `reasoning_loop`. It can mistake a long, deliberately repeated checklist for a
   loop; keep it off where the thinking legitimately repeats whole passages.
+
+### Answer now
+
+`POST /v1/answer_now` with `{"request_id": "<id>"}` ends the thinking of a running reply, and the
+reply goes on to its answer in the same response. The id is the reply's response header:
+`x-request-id` for Chat Completions and Responses, `request-id` for Anthropic Messages; every one of
+these replies, streaming or not, carries it from its first byte. The reply closes its thinking at
+the end of its next decode round with the control span a reached thinking budget commits (above),
+so no prompt is read again; a reply still queued or reading its prompt accepts the call and closes
+at its first round. Gemma 4, Flint and Inkling 2 close the reasoning block they opened, as their
+budget does, and can open no other in that response.
+
+| Response | Meaning |
+|---|---|
+| `200 {"request_id": "<id>", "status": "accepted"}` | the reply closes its thinking at the end of its next round in thinking; a repeated call is accepted again |
+| `404 request_not_found` | no running reply has this id: it has finished, or the id is wrong |
+| `409 already_answering` | the reply has published answer text, or it does not reason (thinking off) |
+
+A reply whose remaining output budget cannot hold the control span and one more token, or whose
+thinking budget could not be enforced (early close unavailable, above), keeps thinking. The console
+line and the request log (`answer_now`, `answer_now_thinking_tokens`) record the thinking tokens
+before the close. Raw-prompt completions have no thinking to end and are not enrolled.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The other standard
 values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template unchanged.
@@ -1570,7 +1660,8 @@ curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France 
 
 Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
 candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
-a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
+a random one), `stop` (a string or up to 32 strings), [`bad_words`](#banned-words), `ignore_eos`,
+`stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
 output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
 the request out of the context cache). The output limit is llama.cpp's `n_predict`, then
@@ -1935,6 +2026,7 @@ wire response contains typed `output` Items.
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `lora` | llama.cpp's [LoRA adapter scales](#lora-adapters-and-control-vectors), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
+| `bad_words` | vLLM's [banned words](#banned-words), or `null`; needs `--structured-output`; rejected by input token count |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, a named function, `required` over a single callable tool, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
@@ -2238,7 +2330,8 @@ explicitly.
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k` (clamped to 20
-like the OpenAI endpoints), and `stop_sequences` enter Engine execution. A matched custom stop is returned as
+like the OpenAI endpoints), `stop_sequences` and vLLM's [`bad_words`](#banned-words) enter Engine
+execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
@@ -2514,7 +2607,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency), [Inkling 2](inkling2.md#expert-residency), [DeepSeek-V4.1](deepseek-v41.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4, Flint, Inkling 2 and DeepSeek-V4.1 bring misses into whole-layer device banks | `device` |
 | `--embedding-residency device\|host` | Qwen3.5 family: the input token embedding in the GPU's weight arena, or in pinned host memory mapped into the GPU, which the gather reads in place over the bus each step. The table's VRAM goes to the KV cache (Qwen3.8-27B: 388 MiB for an IQ2_S table, 1.26 GiB for Q8); output is unchanged. Excludes `--embedding-q4/q6`; refused for an artifact whose embedding is tied to the output head and for the other families. On Windows (WDDM) mapped host memory may still count against the card | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; native Qwen, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 allow `0` and then keep only their layer banks, and Flash-Next disk mode needs a cache. With automatic KV, native Qwen gives the cache priority over KV beyond one request's context | `auto` (what is free after startup) |
-| `--expert-host-mib N` | Host experts: pin at most `N` MiB of them, in the artifact's order; the rest are read from the artifact's files as disk experts are, with the same results. By default the pinned block holds as many as fit the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still lock (about half the RAM) less 4 GiB for what startup pins later; a part the host refuses ends the block. Qwen3.8-Flash-Next GGUF experts that do not all fit run as disk experts, each copied from its pinned bytes where the block holds it ([Flash-Next](qwen3-8-flash-next.md#host-experts-that-do-not-all-fit)). Needs `--expert-residency host` | as many as fit |
+| `--expert-host-mib N` | Host experts: pin at most `N` MiB of them, in the artifact's order; the rest are read from the artifact's files as disk experts are, with the same results. By default the pinned block holds as many as fit the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still lock (WDDM's budget, about half of Windows' memory however much WSL2 is given) less 4 GiB for what startup pins later. `N` replaces that segment estimate: the block then ends at `N` MiB, the available memory or the first part the host refuses, and a block that takes the whole segment can make a later startup pin fail. A part the host refuses ends the block, and the startup line names what ended it. Qwen3.8-Flash-Next GGUF experts that do not all fit run as disk experts, each copied from its pinned bytes where the block holds it ([Flash-Next](qwen3-8-flash-next.md#host-experts-that-do-not-all-fit)). Needs `--expert-residency host` | as many as fit |
 | `--expert-misses staged\|mapped` | Qwen3.8-Flash-Next only, GGUF host experts: copy each missing expert to the device while the cached experts run, into a cache slot when the [expert tier](qwen3-8-flash-next.md#the-expert-cache) admits it (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
 | `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next host experts' calls of 9 to 64 tokens give the CPU only missing experts with at most eight pairs; wider Flash-Next calls, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 calls of more than eight tokens, and Qwen3.5/3.6 calls at or past the codec's prefill frontier or that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
 | `--iq1m-experts matrix\|vector` | DeepSeek-V4.1 and Qwen3.8-Flash-Next: IQ1_M routed experts of calls past eight tokens on the integer matrix kernel once a call routes more than 16 rows to each expert on average for their gate and up products and 6 for their down products (the vector kernel below), or always on the vector kernel in groups of eight columns; the two round the sums differently, so outputs differ slightly ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) | `matrix` |
@@ -2773,7 +2866,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, redacted argv, and `arguments`: the redacted options the server runs with, its `--config` files merged under the command line ([launch configuration files](cli.md#launch-configuration-files)) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 

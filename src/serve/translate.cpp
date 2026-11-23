@@ -469,6 +469,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
         // path a reached thinking budget uses.
         options.execution.thinking.loop = server.reasoning_loop;
     }
+    options.execution.thinking.answer_now  = request.answer_now;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =
         resolve_post_thinking_overrides(request.post_thinking, server);
@@ -484,6 +485,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             options.execution.post_thinking_sampling->presence_penalty = 0.0F;
         }
     }
+    options.execution.bad_words      = request.bad_words;
     options.execution.logprobs       = request.logprobs;
     options.execution.readout_tokens = request.readout_tokens;
     options.execution.speculative_drafting = request.speculative_drafting;

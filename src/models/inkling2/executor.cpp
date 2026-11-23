@@ -22,6 +22,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
@@ -506,15 +507,20 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
         }
         // A full visit's decode or verification row splits its keys so that one row's blocks
-        // number about 32 per multiprocessor, at most 512 (the combine's capacity); the kernel
-        // uses fewer while the keys are short (active_splits). Every row of every call splits
-        // alike, so a verification row computes what a decode step at its position computes. On
-        // an RTX 3090 after 120K tokens 32 (328 splits) decoded at 67.1 tok/s, 16 at 66.7, 64
-        // (512) at 67.0 but 1.2% slower after 32K, and 128 splits at 65.5; 2 a multiprocessor
-        // decoded 4-40% slower.
-        const int sms         = device.multiprocessor_count();
+        // number about two per multiprocessor on tensor cores, at most 512 (the combine's
+        // capacity); the kernel uses fewer while the keys are short (active_splits). Every row of
+        // every call splits alike, so a verification row computes what a decode step at its
+        // position computes. On an RTX 3090 (82 multiprocessors, 8 KV heads) the tensor-core
+        // kernel read 114,754 MXFP8 keys in 294 us with 20 splits, 297 with 30, 328 with 21 (some
+        // multiprocessors three blocks), 349 with 41 and 434 with 10; four verification rows took
+        // 689 us with 20, 688 with 10 and 694 with 30; after 32,070 keys 20 splits took 94 us and
+        // 41 took 110. Volta's SIMT kernel keeps about 32 blocks a multiprocessor.
+        const int sms = device.multiprocessor_count();
+        const int kv_divisor = std::max(1, kv_heads);
         decode_splits_full =
-            std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
+            ops::kBuildVolta && ops::device_tier(device.rank(0).device) == ops::DeviceTier::Volta
+                ? std::clamp((32 * sms + kv_divisor - 1) / kv_divisor, 1, 512)
+                : std::clamp(2 * sms / kv_divisor, 1, 512);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
@@ -1776,6 +1782,18 @@ struct Executor::Impl {
                            config.up_cap, middle, on);
     }
 
+    // The same middles as the down product's vector activation `act` (vector_activation_bytes of
+    // width x pairs).
+    void situ_q8(const float* gu, int pairs, const float* pair_scale, void* act,
+                 cudaStream_t on) const {
+        const int width = int(config.moe_intermediate_size);
+        auto* base      = static_cast<std::byte*>(act);
+        const std::size_t scales = gguf::vector_activation_scales_offset(width, pairs);
+        kernels::situ_q8(gu, 2 * std::int64_t(width), pairs, width, pair_scale, config.gate_cap,
+                         config.up_cap, reinterpret_cast<std::int8_t*>(base),
+                         reinterpret_cast<half2*>(base + scales), on);
+    }
+
     // A BF16 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows `gu`, their
     // SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
     void bf16_experts(const void* const* tables, const gguf::MoeRouting& routing, int max_active,
@@ -1833,8 +1851,7 @@ struct Executor::Impl {
             rows.f32 = gu;
             gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
                                      rows, chunk, on);
-            situ(gu, pairs, pair_scale, middle, on);
-            gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, on);
+            situ_q8(gu, pairs, pair_scale, act2, on);
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
@@ -1990,6 +2007,33 @@ struct Executor::Impl {
         }
         project_f32(Tensor(const_cast<__nv_bfloat16*>(x), DType::BF16, {w.k, t}), w, out,
                     column_stride, row);
+    }
+
+    // product() for a layer's projections of one call: with q8_1 inputs those of one block type
+    // and row size share a launch (ops::detail::gguf_vector_project).
+    struct Projection {
+        const Weight* w;
+        const void* xq;
+        const __nv_bfloat16* x;
+        float* out;
+        int column_stride;
+        int row;
+    };
+    void products(std::span<const Projection> list, int t) {
+        if (std::any_of(list.begin(), list.end(), [](const Projection& p) { return p.xq == nullptr; })) {
+            for (const Projection& p : list) {
+                product(*p.w, p.xq, p.x, t, p.out, p.column_stride, p.row);
+            }
+            return;
+        }
+        std::vector<ops::detail::GgufVectorProduct> queued(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            queued[i].weight            = list[i].w;
+            queued[i].activation        = list[i].xq;
+            queued[i].out.f32           = list[i].out + list[i].row;
+            queued[i].out.column_stride = list[i].column_stride;
+        }
+        ops::detail::gguf_vector_project(queued, t, stream);
     }
 
     static constexpr std::size_t kStagingRegions = 4;
@@ -2358,11 +2402,13 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
+        std::vector<Projection> qkv;
         for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            qkv.push_back({&lp.query[i], input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
+        qkv.push_back({&lp.key, input_q(c, ki), bf16_in(ki), kv, 2 * kvd, 0});
+        qkv.push_back({&lp.value, input_q(c, vi), bf16_in(vi), kv, 2 * kvd, kvd});
+        products(qkv, t);
         kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
@@ -2375,30 +2421,27 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
-        {
-            kernels::QueryArgs qa;
-            qa.qgr             = qgr;
-            qa.stride          = lp.query_rows;
-            qa.relative_column = 2 * q_floats;
-            qa.tokens          = t;
-            qa.heads           = query_heads;
-            qa.query_clip      = lp.query_clip;
-            qa.relative_clip   = lp.relative_clip;
-            qa.qk_clip         = config.qk_clip;
-            qa.rel_clip        = config.relative_clip;
-            qa.log_scale       = lp.full;
-            qa.alpha           = config.log_scale_alpha;
-            qa.floor           = float(config.log_scale_floor);
-            qa.positions       = c.rows.positions;
-            qa.q_out           = q;
-            qa.r_out           = r;
-            kernels::query_post(qa, stream);
-        }
-        // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
-        // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A full visit of an
-        // mxfp8 run has kv_post encode its rows into its planes; one of rk8v4 or rk4v4 stages
-        // them as F16 (one slot per row) for kv_store to encode.
+        kernels::QueryArgs qa;
+        qa.qgr             = qgr;
+        qa.stride          = lp.query_rows;
+        qa.relative_column = 2 * q_floats;
+        qa.tokens          = t;
+        qa.heads           = query_heads;
+        qa.query_clip      = lp.query_clip;
+        qa.relative_clip   = lp.relative_clip;
+        qa.qk_clip         = config.qk_clip;
+        qa.rel_clip        = config.relative_clip;
+        qa.log_scale       = lp.full;
+        qa.alpha           = config.log_scale_alpha;
+        qa.floor           = float(config.log_scale_floor);
+        qa.positions       = c.rows.positions;
+        qa.q_out           = q;
+        qa.r_out           = r;
+        // K and V into the cache, in the launch that also writes Q: a prompt chunk's sliding visit
+        // attends over the staging ring (the window before the chunk comes over from the
+        // sequence's ring, the chunk's keys land there, and the window that ends the chunk's kept
+        // rows goes back). A full visit of an mxfp8 run encodes its rows into its planes there;
+        // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
@@ -2473,7 +2516,7 @@ struct Executor::Impl {
             ka.head_stride = vp.head_stride;
             ka.ring        = vp.ring;
         }
-        kernels::kv_post(ka, stream);
+        kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
@@ -2647,9 +2690,17 @@ struct Executor::Impl {
                                               const_cast<std::int32_t*>(routing.tiles),
                                               routing.tile_capacity};
         }
-        kernels::route(route, stream);
+        // The vector route's fixed-point sums start from zero in the route launch.
         const bool vector = c.q8;
-        const void* act   = vector ? c.ffn_q.base : nullptr;
+        unsigned long long* fixed = nullptr;
+        if (vector && !model.expert_parallel()) {
+            fixed = static_cast<unsigned long long*>(
+                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
+            route.zero       = fixed;
+            route.zero_count = std::int64_t(t) * hidden;
+        }
+        kernels::route(route, stream);
+        const void* act = vector ? c.ffn_q.base : nullptr;
         if (model.expert_parallel()) {
             experts_parallel(p, c.ffn_bf16, act, ids, weights, pair_scale, t, ra);
             return;
@@ -2672,16 +2723,11 @@ struct Executor::Impl {
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width,
                                   p.down_aligned16};
         const int max_active = std::min(pairs, e);
-        auto* middle = static_cast<__nv_bfloat16*>(
-            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
-            auto* fixed = static_cast<unsigned long long*>(
-                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
-            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
+            void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2690,8 +2736,7 @@ struct Executor::Impl {
             const auto compute = [&](const gguf::MoeRouting& part) {
                 gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
                                          rows, chunk, stream);
-                situ(gu, pairs, pair_scale, middle, stream);
-                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                situ_q8(gu, pairs, pair_scale, act2, stream);
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };
@@ -2719,6 +2764,8 @@ struct Executor::Impl {
             ra.fixed = fixed;
             return;
         }
+        auto* middle = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (delivery) { delivery->await(stream); }
         if (p.bf16) {
             auto* rows = static_cast<float*>(
@@ -3349,6 +3396,14 @@ struct Executor::Impl {
     // A position's state lies in the rings while the sequence has written fewer positions past it
     // than the sliding rings hold beyond the window and a round's drafts, and than the histories
     // hold beyond the convolutions' three earlier inputs and a round's drafts.
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t drafts = std::int64_t(options.draft_tokens);
+        const std::int64_t slack  = std::min<std::int64_t>(std::int64_t(ring) - window - drafts,
+                                                           kR - (kTaps - 1) - drafts);
+        return slack > 0 ? std::uint32_t(slack) : 0;
+    }
+
     bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
         const std::uint32_t at = positions.at(sequence);
         const std::int64_t drafts = std::int64_t(options.draft_tokens);
@@ -3497,6 +3552,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+    return impl_->rewind_reach(sequence, position);
 }
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {
