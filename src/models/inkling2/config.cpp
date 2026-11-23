@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "models/inkling2/config.h"
 
 #include <cmath>
@@ -96,6 +98,17 @@ TextConfig parse_text_config(const Json& value) {
     out.block_size              = integer(value, "n_layers_per_attn_res_block");
     out.num_experts             = integer(value, "n_routed_experts");
     out.top_k_experts           = integer(value, "num_experts_per_tok");
+    // hp-tune: NINFER_INK_TOPK=N (1..trained k) routes each token to its N best experts instead of
+    // the trained k; the chosen weights are renormalized over the N (the route kernel divides by the
+    // sum of the chosen p). Fewer misses and products per token at a quality cost to be measured.
+    if (const char* v = std::getenv("NINFER_INK_TOPK"); v && *v) {
+        const long n = std::strtol(v, nullptr, 10);
+        if (n >= 1 && n < long(out.top_k_experts)) {
+            std::fprintf(stderr, "hp-tune: Inkling 2 experts per token %ld (trained %u)\n", n,
+                         unsigned(out.top_k_experts));
+            out.top_k_experts = std::uint32_t(n);
+        }
+    }
     out.moe_intermediate_size   = integer(value, "intermediate_size");
     out.gate_cap                = real(value, "mlp_gate_softcap");
     out.up_cap                  = real(value, "mlp_up_softcap");
