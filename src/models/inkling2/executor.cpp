@@ -1343,6 +1343,35 @@ struct Executor::Impl {
         std::fprintf(stderr, "hp-tune: tier every=%u swaps=%u decay=%.2f gain=%.2f reserve=%zu MiB headroom=%zu MiB\n",
                      unsigned(transport.tier.every), unsigned(transport.tier.swaps), double(transport.tier.decay),
                      double(transport.tier.min_gain), kGraphReserve >> 20, kKvHeadroom >> 20);
+        // hp-tune (N6): NINFER_SLOTS_BY_WEIGHT=1 sizes the cache's pools by the routing profile
+        // (built-in or --expert-profile). The narrow calls record the loop's layers once per pass,
+        // so a profile from them already counts the passes; one whose loop layers do not route
+        // clearly more than the others (less than 1.5x on average) is taken as counted once a
+        // token and its loop layers are multiplied by the passes.
+        if (env_flag("NINFER_SLOTS_BY_WEIGHT") && options.expert_profile &&
+            options.expert_profile->size() == model.expert_banks().size()) {
+            const auto& profile = *options.expert_profile;
+            double in_loop = 0, outside = 0;
+            std::size_t n_in = 0, n_out = 0;
+            for (std::size_t l = 0; l < profile.size(); ++l) {
+                double sum = 0;
+                for (const auto c : profile[l]) { sum += double(c); }
+                (config.core(std::uint32_t(l)) ? in_loop : outside) += sum;
+                ++(config.core(std::uint32_t(l)) ? n_in : n_out);
+            }
+            const double ratio = n_in && n_out && outside > 0
+                                     ? (in_loop / double(n_in)) / (outside / double(n_out)) : 0.0;
+            const double times = n_in && ratio < 1.5 ? double(config.num_passes) : 1.0;
+            for (std::size_t l = 0; l < profile.size(); ++l) {
+                const double k = config.core(std::uint32_t(l)) ? times : 1.0;
+                auto& w = transport.slot_weights.emplace_back();
+                for (const auto c : profile[l]) { w.push_back(double(c) * k); }
+            }
+            std::fprintf(stderr, "hp-tune: N6 slots by weight: loop layers route %.2fx the others "
+                                 "a layer in the profile, weighted x%.0f\n", ratio, times);
+        }
+        std::fprintf(stderr, "hp-tune: knobs NINFER_SLOTS_BY_WEIGHT=%d\n",
+                     int(!transport.slot_weights.empty()));
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
         // Where a device's copies queue behind one another whatever their streams
@@ -1359,6 +1388,12 @@ struct Executor::Impl {
             p.gate_up_aligned16 = aligned(0) && aligned(1) && aligned(2);
             p.down_aligned16    = aligned(3);
         }
+    }
+
+    // hp-tune: an environment switch, on when set to 1.
+    static bool env_flag(const char* name) {
+        const char* e = std::getenv(name);
+        return e != nullptr && std::atoi(e) == 1;
     }
 
     static constexpr std::uint32_t kFullChunk  = 2048;

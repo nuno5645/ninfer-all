@@ -25,6 +25,8 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <cstdio>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -325,6 +327,8 @@ struct ExpertDelivery::Impl {
     std::vector<std::uint64_t> slot_offset, slot_size, bank_offset, bank_size, tail;
     std::uint64_t slot_bytes = 0, bank_bytes = 0;
     std::vector<Pool> pools;
+    // hp-tune (N6): per pool, its layers' profile routes, most first (empty: slots by layer).
+    std::vector<std::vector<double>> pool_routes;
     // What backs a pool's slots: an elastic cache maps whole granules for each pool; one region
     // holds every pool's slots and rounds once.
     std::uint64_t unit         = 1;
@@ -631,6 +635,22 @@ struct ExpertDelivery::Impl {
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
             return free > options.keep_free_bytes ? free - options.keep_free_bytes : 0;
         };
+        // hp-tune (N6): the pools' routes per slot from the profile, most routed first.
+        if (!options.slot_weights.empty()) {
+            if (options.slot_weights.size() != layers.size()) {
+                throw std::invalid_argument("expert delivery: slot weights describe other layers");
+            }
+            pool_routes.assign(pools.size(), {});
+            for (std::size_t li = 0; li < layers.size(); ++li) {
+                const auto& w = options.slot_weights[li];
+                if (w.size() != layers[li].source.experts.size()) {
+                    throw std::invalid_argument("expert delivery: slot weights of another bank width");
+                }
+                auto& routes = pool_routes[layers[li].pool];
+                routes.insert(routes.end(), w.begin(), w.end());
+            }
+            for (auto& routes : pool_routes) { std::sort(routes.begin(), routes.end(), std::greater<>()); }
+        }
         // Banks before the cache: every miss lands in one. A second bank is dropped before the
         // last one, and an explicit cache keeps its size by dropping the second bank first.
         std::uint32_t bank_count = options.banks;
@@ -734,6 +754,15 @@ struct ExpertDelivery::Impl {
         cache_span = options.elastic ? cache.growable.bytes() : cache.bytes;
         allocation.cache_bytes = cache.backing_bytes();
         allocation.cache_slots = cache_slots();
+        if (!pool_routes.empty()) {
+            std::string line;
+            for (std::size_t p = 0; p < pools.size(); ++p) {
+                line += " " + std::to_string(pools[p].count) + "/" + std::to_string(pools[p].layers) +
+                        "L@" + std::to_string(pools[p].slot_bytes >> 10) + "K";
+            }
+            std::fprintf(stderr, "hp-tune: N6 slots by weight, pools (slots/layers@slot):%s\n",
+                         line.c_str());
+        }
         call_routed.assign(max_experts, 0);
         call_cpu.assign(max_experts, 0);
         call_count.assign(max_experts, 0);
@@ -876,8 +905,33 @@ struct ExpertDelivery::Impl {
         return x != y ? x < y : a < b;
     }
 
+    // hp-tune (N6): the profile routes per byte of pool p's slot n (-1 past its experts).
+    [[nodiscard]] double slot_value(std::size_t p, std::uint32_t n) const {
+        const auto& routes = pool_routes[p];
+        return n < routes.size() ? routes[n] / double(pools[p].slot_bytes) : -1.0;
+    }
+    // Whether pool a's next slot (after na) goes before pool b's (after nb).
+    [[nodiscard]] bool before_in_fill(std::size_t a, std::uint32_t na, std::size_t b,
+                                      std::uint32_t nb) const {
+        if (!pool_routes.empty()) {
+            const double va = slot_value(a, na), vb = slot_value(b, nb);
+            if (va != vb) { return va > vb; }
+        }
+        return fewer(a, na, b, nb);
+    }
+    // Whether pool p's last slot (of np) leaves before pool w's (of nw).
+    [[nodiscard]] bool before_in_trim(std::size_t p, std::uint32_t np, std::size_t w,
+                                      std::uint32_t nw) const {
+        if (!pool_routes.empty()) {
+            const double vp = slot_value(p, np - 1), vw = slot_value(w, nw - 1);
+            if (vp != vw) { return vp < vw; }
+        }
+        return fewer(w, nw, p, np);
+    }
+
     // From `counts` (each pool's slots), one slot at a time to the pool whose layers hold the
-    // fewest each, among those with experts left whose next slot keeps the backing within
+    // fewest each (hp-tune N6: or whose next slot holds the most profile routes per byte), among
+    // those with experts left whose next slot keeps the backing within
     // `bytes`: every layer about as many slots as any other, whatever its experts' size.
     [[nodiscard]] std::vector<std::uint32_t> fill_pools(std::uint64_t bytes,
                                                         std::vector<std::uint32_t> counts) const {
@@ -889,7 +943,7 @@ struct ExpertDelivery::Impl {
                 if (counts[p] >= pools[p].capacity) { continue; }
                 const auto more = backing(pools[p], counts[p] + 1) - backing(pools[p], counts[p]);
                 if (more > bytes - std::min(bytes, used)) { continue; }
-                if (best == pools.size() || fewer(p, counts[p], best, counts[best])) { best = p; }
+                if (best == pools.size() || before_in_fill(p, counts[p], best, counts[best])) { best = p; }
             }
             if (best == pools.size()) { return counts; }
             used += backing(pools[best], counts[best] + 1) - backing(pools[best], counts[best]);
@@ -907,7 +961,7 @@ struct ExpertDelivery::Impl {
             std::size_t worst = pools.size();
             for (std::size_t p = 0; p < pools.size(); ++p) {
                 if (counts[p] == 0) { continue; }
-                if (worst == pools.size() || fewer(worst, counts[worst], p, counts[p])) {
+                if (worst == pools.size() || before_in_trim(p, counts[p], worst, counts[worst])) {
                     worst = p;
                 }
             }

@@ -110,6 +110,12 @@ struct ExpertDeliveryOptions {
     // Which experts the cache holds once it is full (core/expert_tier.h), a pool per slot size.
     ExpertTierOptions tier{};
     ExpertCpuOptions cpu{};
+    // hp-tune (N6, NINFER_SLOTS_BY_WEIGHT): routes per [layer][expert] (a routing profile, the
+    // loop's passes counted). Nonempty: fill_pools and trim_pools give each next slot to the pool
+    // whose next most routed expert has the most routes per byte of slot (and take the last one
+    // from the pool whose last held expert has the fewest), instead of about as many slots per
+    // layer. Which experts sit in the slots still follows the tier, so results stay bit-exact.
+    std::vector<std::vector<double>> slot_weights;
 };
 struct ExpertDeliveryStats {
     std::uint64_t requests = 0, routes = 0, hits = 0, misses = 0, evictions = 0;
