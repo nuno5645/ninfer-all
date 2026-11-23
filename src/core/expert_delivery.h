@@ -116,6 +116,13 @@ struct ExpertDeliveryOptions {
     // from the pool whose last held expert has the fewest), instead of about as many slots per
     // layer. Which experts sit in the slots still follows the tier, so results stay bit-exact.
     std::vector<std::vector<double>> slot_weights;
+    // hp-tune (N12): a family whose layers [loop_first, loop_end) run loop_passes times a token
+    // (Inkling 2's core). A narrow call to a layer below the last narrow call's and below the loop
+    // starts a token. loop_belady (NINFER_LOOP_BELADY): a loop layer's experts routed by a pass
+    // that is not the token's last are guarded until the layer's next pass, so neither a cache
+    // admission, a tier round nor a lent slot evicts them while an unguarded victim exists.
+    std::uint32_t loop_first = 0, loop_end = 0, loop_passes = 1;
+    bool loop_belady = false;
 };
 struct ExpertDeliveryStats {
     std::uint64_t requests = 0, routes = 0, hits = 0, misses = 0, evictions = 0;

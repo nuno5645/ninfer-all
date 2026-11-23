@@ -326,6 +326,11 @@ struct ExpertDelivery::Impl {
     // bank region offset/size and the zero tail kept after a bank run.
     std::vector<std::uint64_t> slot_offset, slot_size, bank_offset, bank_size, tail;
     std::uint64_t slot_bytes = 0, bank_bytes = 0;
+    // hp-tune (N12): this token's narrow visits per layer, the tokens seen, the served call's
+    // visit of its loop layer this token, and lent slots taken from guarded experts.
+    std::vector<std::uint32_t> loop_visits;
+    std::uint64_t loop_tokens = 0, loop_forced = 0;
+    std::int64_t loop_visit = -1;
     std::vector<Pool> pools;
     // hp-tune (N6): per pool, its layers' profile routes, most first (empty: slots by layer).
     std::vector<std::vector<double>> pool_routes;
@@ -763,6 +768,11 @@ struct ExpertDelivery::Impl {
             std::fprintf(stderr, "hp-tune: N6 slots by weight, pools (slots/layers@slot):%s\n",
                          line.c_str());
         }
+        loop_visits.assign(layers.size(), 0);
+        if (options.loop_passes < 2 || options.loop_first >= options.loop_end ||
+            options.loop_end > layers.size()) {
+            options.loop_belady = false;
+        }
         call_routed.assign(max_experts, 0);
         call_cpu.assign(max_experts, 0);
         call_count.assign(max_experts, 0);
@@ -1091,10 +1101,14 @@ struct ExpertDelivery::Impl {
                 const auto& slot = lent_slots[std::size_t(l)];
                 if (slot.layer == std::int32_t(li) && call_routed[std::size_t(slot.expert)]) { continue; }
                 if (std::find(taken.begin(), taken.end(), l) != taken.end()) { continue; }
+                // hp-tune (N12): a guarded expert (due again this token) only after the others.
                 const auto key =
                     slot.layer < 0
                         ? std::tuple{0, 0.0F, std::uint64_t(0)}
-                        : std::tuple{1, tier->count(std::size_t(slot.layer), slot.expert),
+                        : std::tuple{options.loop_belady &&
+                                             tier->guarded(std::size_t(slot.layer), slot.expert)
+                                         ? 2 : 1,
+                                     tier->count(std::size_t(slot.layer), slot.expert),
                                      slot.used};
                 if (best < 0 || key < best_key) {
                     best     = l;
@@ -1108,6 +1122,10 @@ struct ExpertDelivery::Impl {
     // Copies a narrow call's missing expert e of layer li into lent slot l.
     void admit_lent(std::int32_t l, std::size_t li, std::int32_t e, ExpertDeliveryStats& delta) {
         const auto& slot = lent_slots[std::size_t(l)];
+        if (slot.layer >= 0 && options.loop_belady &&
+            tier->guarded(std::size_t(slot.layer), slot.expert)) {
+            ++loop_forced; // hp-tune (N12): every lent slot held a guarded expert
+        }
         if (slot.layer >= 0) {
             point_nowhere(std::size_t(slot.layer), slot.expert);
             ++delta.lent_evictions;
@@ -1395,6 +1413,42 @@ struct ExpertDelivery::Impl {
         }
     }
 
+    // hp-tune (N12): before a call's misses are placed. A wide call ends the token's guards;
+    // a narrow one may start a token, and at a loop layer it moves the layer's guards to the
+    // experts it routes when the token visits the layer again.
+    void loop_begin(std::size_t li, bool wide) {
+        loop_visit = -1;
+        if (!options.loop_belady) { return; }
+        if (wide) {
+            tier->clear_guards();
+            std::fill(loop_visits.begin(), loop_visits.end(), 0);
+            return;
+        }
+        if (last_narrow < 0 ||
+            (std::int64_t(li) < last_narrow && li < std::size_t(options.loop_first))) {
+            tier->clear_guards();
+            std::fill(loop_visits.begin(), loop_visits.end(), 0);
+            if (++loop_tokens % 256 == 0) { loop_report(); }
+        }
+        if (li < options.loop_first || li >= options.loop_end) { return; }
+        loop_visit = std::int64_t(loop_visits[li]++);
+        const auto n = std::int32_t(layers[li].source.experts.size());
+        const bool again = std::uint32_t(loop_visit) + 1 < options.loop_passes;
+        for (std::int32_t e = 0; e < n; ++e) {
+            tier->guard(li, e, again && call_routed[std::size_t(e)] != 0);
+        }
+    }
+
+    void loop_report() const {
+        if (options.loop_belady) {
+            std::fprintf(stderr,
+                         "hp-tune: N12 after %llu tokens: %llu guarded admission victims passed "
+                         "over, %llu guarded lent slots taken (no other)\n",
+                         (unsigned long long)loop_tokens, (unsigned long long)tier->guard_skips(),
+                         (unsigned long long)loop_forced);
+        }
+    }
+
     // A pass has ended: the tier's round. Victims leave now (never an expert the served call
     // routes); candidates hold their slots pending until post work has copied them in.
     void round(ExpertDeliveryStats& delta) {
@@ -1411,8 +1465,9 @@ struct ExpertDelivery::Impl {
             } else {
                 s = layers[swap.out_layer].slot_of[std::size_t(swap.out)];
                 if (s < 0 || slots[std::size_t(s)].pending ||
-                    (swap.out_layer == call_layer && call_routed[std::size_t(swap.out)])) {
-                    continue;
+                    (swap.out_layer == call_layer && call_routed[std::size_t(swap.out)]) ||
+                    (options.loop_belady && tier->guarded(swap.out_layer, swap.out))) {
+                    continue; // hp-tune (N12): a guarded victim stays
                 }
                 evict(s, delta);
             }
@@ -1746,6 +1801,7 @@ struct ExpertDelivery::Impl {
         previous_layer = std::int64_t(li);
         previous_wide  = wide;
         const bool new_pass = !wide && last_narrow >= 0 && std::int64_t(li) < last_narrow;
+        loop_begin(li, wide); // hp-tune (N12)
         if (wide) { quiet_passes = 0; }
         if (per_bank && new_pass && ++quiet_passes >= 2) {
             // Only narrow calls ran for two passes: the banks become cache slots.

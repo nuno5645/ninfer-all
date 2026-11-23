@@ -78,6 +78,14 @@ public:
         std::int32_t out        = -1;
         float gain              = 0;
     };
+    // hp-tune (N12): guarded experts (a loop layer's experts that its next pass in the token will
+    // likely route again) are never an admission victim. Nothing is guarded by default.
+    void guard(std::size_t layer, std::int32_t expert, bool on);
+    void clear_guards();
+    [[nodiscard]] bool guarded(std::size_t layer, std::int32_t expert) const;
+    // Guarded experts an admission scan passed over.
+    [[nodiscard]] std::uint64_t guard_skips() const noexcept { return guard_skips_; }
+
     // Ends a decode pass. Every `every` passes: the round's swaps, best gain first, and the counts'
     // decay. The caller carries them out and reports the states.
     [[nodiscard]] std::vector<Swap> end_pass();
@@ -106,6 +114,8 @@ private:
     void order_cold(std::uint32_t pool, std::size_t at);
     std::vector<std::uint32_t> layer_of_; // by entry
     std::uint32_t passes_ = 0;
+    std::vector<unsigned char> guard_; // hp-tune (N12): by entry, empty until the first guard
+    std::uint64_t guard_skips_ = 0;
 };
 
 } // namespace ninfer

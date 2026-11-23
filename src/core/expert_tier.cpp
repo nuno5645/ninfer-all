@@ -63,7 +63,23 @@ float ExpertTier::count(std::size_t layer, std::int32_t expert) const {
 
 void ExpertTier::set_free(std::uint32_t pool, std::uint32_t slots) { free_.at(pool) = slots; }
 
+void ExpertTier::guard(std::size_t layer, std::int32_t expert, bool on) {
+    const std::size_t i = index(layer, expert);
+    if (guard_.empty()) {
+        if (!on) { return; }
+        guard_.assign(entries_.size(), 0);
+    }
+    guard_[i] = on ? 1 : 0;
+}
+
+void ExpertTier::clear_guards() { std::fill(guard_.begin(), guard_.end(), 0); }
+
+bool ExpertTier::guarded(std::size_t layer, std::int32_t expert) const {
+    return !guard_.empty() && guard_[index(layer, expert)] != 0;
+}
+
 void ExpertTier::reset() {
+    clear_guards();
     std::fill(entries_.begin(), entries_.end(), Entry{});
     std::fill(free_.begin(), free_.end(), 0);
     for (auto& list : cold_) { list.clear(); }
@@ -126,6 +142,11 @@ ExpertTier::Victim ExpertTier::admission_victim(std::size_t layer, std::int32_t 
         const std::uint32_t l = layer_of_[i];
         const auto e          = std::int32_t(i - offset_[l]);
         if (victim.state != State::Held) { continue; }
+        // hp-tune (N12): a guarded expert is due again this token; it does not use up the scan.
+        if (!guard_.empty() && guard_[i] != 0) {
+            ++guard_skips_;
+            continue;
+        }
         ++held;
         if (l == layer && std::size_t(e) < busy.size() && busy[std::size_t(e)] != 0) { continue; }
         if (candidate >= victim.count + options_.min_gain) { return {l, e}; }
