@@ -3423,4 +3423,11 @@ void add_fixed(unsigned long long* sums, const void* products, const std::int32_
     check_launch("add_fixed");
 }
 
+__global__ void probe_empty_kernel() {}
+
+void probe_empty(int count, cudaStream_t stream) {
+    for (int i = 0; i < count; ++i) { probe_empty_kernel<<<1, 1, 0, stream>>>(); }
+    check_launch("probe_empty");
+}
+
 } // namespace ninfer::models::inkling2::kernels

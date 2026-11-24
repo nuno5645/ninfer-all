@@ -204,6 +204,19 @@ struct ExpertDeliverySkip {
     int top_k           = 0;
 };
 
+// hp-tune (probe, NINFER_INK_PROBE): one served call as the service thread saw it. `copied`: the
+// missing experts whose bytes this call copied (a cache slot, a lent slot or the layer's bank);
+// `bytes` their host-to-device bytes. Clocks in steady_clock nanoseconds: the request seen, its
+// copies issued, the CPU's products done (the issue time when the CPU had none), its copies done
+// and the ready signal.
+struct ExpertProbeRecord {
+    std::uint32_t sequence = 0, layer = 0;
+    std::uint32_t routes = 0, hits = 0, misses = 0, copied = 0, cpu = 0;
+    bool wide = false;
+    std::uint64_t bytes = 0;
+    std::int64_t seen = 0, issued = 0, cpu_done = 0, copies_done = 0, prepared = 0;
+};
+
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
@@ -307,6 +320,13 @@ public:
     std::uint64_t grow_cache();
     // The free device memory grow_cache leaves (ExpertDeliveryOptions::keep_free_bytes).
     void set_keep_free_bytes(std::uint64_t bytes);
+
+    // hp-tune (probe): before the first request, records every served call in a ring of 1024
+    // (lock-free: a record is published before its ready signal). probe_records copies the last
+    // out.size() records, oldest first, and returns how many it wrote; read them only while no
+    // request is in flight (after the compute stream's last call).
+    void probe(bool on);
+    std::size_t probe_records(std::span<ExpertProbeRecord> out) const;
 
 private:
     struct Impl;

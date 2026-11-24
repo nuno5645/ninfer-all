@@ -301,6 +301,35 @@ struct Executor::Impl {
     int decode_splits_full = 1, decode_splits_sliding = 1;
     std::map<std::uint32_t, GraphEntry> graphs;
     std::vector<std::uint32_t> verify_widths;
+    // hp-tune (probe, NINFER_INK_PROBE=N): timed events of a decode or verification call's phases,
+    // read at the next such call, summed and printed every N tokens. Events: [0] the call's start,
+    // [1 + v * kProbeMarks + k] visit v's start (k 0) and the ends of its phases (k 1..8), the last
+    // after the head. Inside a captured graph they are event record nodes.
+    static constexpr int kProbeMarks   = 9;
+    static constexpr int kProbePhases  = 8;
+    static constexpr int kProbeClasses = 4;
+    static constexpr int kProbeParts   = 5; // prelude, the loop's passes 1..3, coda
+    int probe_every = 0;
+    std::vector<cudaEvent_t> probe_events;
+    bool probe_pending = false, probe_entry_valid = false;
+    int probe_rows = 0;
+    std::chrono::steady_clock::time_point probe_entry{};
+    std::uint64_t probe_tokens = 0, probe_window = 0;
+    std::vector<ExpertProbeRecord> probe_records;
+    struct ProbeSums {
+        std::uint64_t calls = 0, rows = 0, walls = 0, attributed = 0, failures = 0;
+        double gpu = 0, embed = 0, head = 0, gaps = 0, wall = 0, wall_gpu = 0, read = 0;
+        double phase[kProbePhases]{}, kind[2][kProbePhases]{};
+        std::uint64_t kind_visits[2]{};
+        double part[kProbeParts]{};
+        std::uint64_t part_visits[kProbeParts]{};
+        std::uint64_t class_visits[kProbeClasses]{};
+        double class_wait[kProbeClasses]{}, class_misses[kProbeClasses]{},
+            class_host[kProbeClasses][4]{};
+        std::uint64_t records = 0;
+        double hits = 0, misses = 0, copied = 0, cpu = 0, bytes = 0, host[4]{};
+    };
+    ProbeSums probe_sums;
     std::unique_ptr<dspine::Runtime> spine;
     std::unique_ptr<Spark> spark;
     // The vision tower and its buffers: an image's patches, a span's rows.
@@ -608,6 +637,7 @@ struct Executor::Impl {
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        plan_probe();
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -1581,6 +1611,10 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (!probe_events.empty()) {
+            ninfer::wait_for_stream(stream);
+            for (cudaEvent_t ev : probe_events) { cudaEventDestroy(ev); }
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -2102,6 +2136,11 @@ struct Executor::Impl {
         int spark_rows    = 0;
         // A call of at most kernels::kSplitRows rows: the split depth mixes' scratch.
         float* split = nullptr;
+        // hp-tune (probe): a decode or verification call that records its phases' events (on a
+        // capturing stream as event record nodes); the visit being recorded and its next mark.
+        bool probe = false, probe_capture = false;
+        std::size_t probe_visit = 0;
+        int probe_next = 0;
     };
 
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
@@ -2341,6 +2380,8 @@ struct Executor::Impl {
         States& s           = c.states;
         const int t         = c.t;
         auto scope          = workspace->scope();
+        c.probe_visit       = v;
+        probe_mark(c, v, 0);
         if (vp.save_prelude) {
             s.prelude_blocks = s.blocks;
             s.prelude_cur    = s.cur;
@@ -2420,6 +2461,7 @@ struct Executor::Impl {
             kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.value_taps, f32_in(vi),
                               taps + kv_heads * kTaps, stream, 0, tap_columns);
         }
+        probe_mark(c, v, 1);
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
         kernels::QueryArgs qa;
@@ -2599,6 +2641,7 @@ struct Executor::Impl {
             back.end   = c.first + c.kept;
             kernels::ring_copy(back, stream);
         }
+        probe_mark(c, v, 2);
         auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
         product(lp.output, c.q8 ? attn_q.base : nullptr, attn, t, y, hidden);
         // The attention's residual update, then the MoE input's mix.
@@ -2627,6 +2670,7 @@ struct Executor::Impl {
             control(c, lp, 1, {c.ffn_raw, nullptr, nullptr}, {c.messages + 3 * c.plane, nullptr, nullptr},
                     {3, 0, 0}, {lp.ffn_norm, nullptr, nullptr}, c.ffn_bf16, c.ffn_q, 0, c.ffn_f32);
         }
+        probe_mark(c, v, 3);
         // The routed experts, then their residual update and the next visit's mix (or the
         // output's after the last visit).
         kernels::ResidualArgs ra;
@@ -2638,6 +2682,7 @@ struct Executor::Impl {
         ra.hidden  = hidden;
         ra.mix.split = c.split;
         experts(lp, c, ra);
+        probe_mark(c, v, 7);
         const bool last = v + 1 == visits.size();
         if (last) {
             ra.mix = output_mix_args(c);
@@ -2650,6 +2695,7 @@ struct Executor::Impl {
             const auto [begin, end] = kept_history(c);
             kernels::keep_products(ra, begin, end, stream);
         }
+        probe_mark(c, v, 8);
     }
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
@@ -2726,6 +2772,7 @@ struct Executor::Impl {
                                        : std::span<const ExpertDelivery::Input>(),
                                    skip);
         }
+        probe_mark(c, c.probe_visit, 4);
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
@@ -2762,7 +2809,9 @@ struct Executor::Impl {
                 };
                 CUDA_CHECK(cudaMemsetAsync(gu, 0, std::size_t(pairs) * 2 * width * 4, stream));
                 compute(stage(call->cached_experts));
+                probe_mark(c, c.probe_visit, 5);
                 delivery->await(stream);
+                probe_mark(c, c.probe_visit, 6);
                 compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
                     kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden,
@@ -2879,6 +2928,7 @@ struct Executor::Impl {
         if (first + std::uint32_t(t) > options.max_context) {
             throw std::invalid_argument("inkling2 forward: context capacity exceeded");
         }
+        probe_break(); // hp-tune (probe)
         if (!widen(t)) {
             // hp-tune (N7): no room for the wide workspace: the chunk runs as chunks of the
             // resident workspace's width, the last one whole and with the logits.
@@ -3006,6 +3056,298 @@ struct Executor::Impl {
         if (spark) { spark_inject(c); }
     }
 
+    // ---- hp-tune: the decode probe (NINFER_INK_PROBE=N) -------------------------------------------
+
+    void plan_probe() {
+        const char* e = std::getenv("NINFER_INK_PROBE");
+        probe_every   = e != nullptr ? std::max(0, std::atoi(e)) : 0;
+        if (probe_every <= 0) { return; }
+        probe_events.resize(2 + visits.size() * kProbeMarks, nullptr);
+        for (cudaEvent_t& ev : probe_events) { CUDA_CHECK(cudaEventCreate(&ev)); }
+        if (delivery) { delivery->probe(true); }
+        std::fprintf(stderr, "hp-probe: on, every %d tokens: %zu events a decode call (%zu visits x "
+                             "%d, the start and the head)\n",
+                     probe_every, probe_events.size(), visits.size(), kProbeMarks);
+    }
+
+    // Records event `index` of the probed call on the compute stream.
+    void probe_record(const Call& c, std::size_t index) {
+        CUDA_CHECK(cudaEventRecordWithFlags(probe_events[index], stream,
+                                            c.probe_capture ? cudaEventRecordExternal
+                                                            : cudaEventRecordDefault));
+    }
+
+    // Visit v's marks up to k (0: its start, 1..8: the ends of its phases); a phase the call's
+    // route skips is marked where the next one ends (zero time).
+    void probe_mark(Call& c, std::size_t v, int k) {
+        if (!c.probe) { return; }
+        if (k == 0) { c.probe_next = 0; }
+        for (int j = c.probe_next; j <= k; ++j) {
+            probe_record(c, 1 + v * kProbeMarks + std::size_t(j));
+        }
+        c.probe_next = std::max(c.probe_next, k + 1);
+    }
+
+    // At start: the cost of a graph node (a graph of 1000 empty kernels against 1000 direct
+    // launches), and whether timed events recorded inside a graph can be read; if not, the probe
+    // runs without CUDA graphs.
+    void probe_calibrate() {
+        constexpr int kNodes = 1000;
+        cudaEvent_t a = nullptr, b = nullptr;
+        CUDA_CHECK(cudaEventCreate(&a));
+        CUDA_CHECK(cudaEventCreate(&b));
+        const auto timed = [&](const auto& work) {
+            CUDA_CHECK(cudaEventRecord(a, stream));
+            work();
+            CUDA_CHECK(cudaEventRecord(b, stream));
+            CUDA_CHECK(cudaEventSynchronize(b));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+            return double(ms);
+        };
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        kernels::probe_empty(kNodes, stream);
+        const double direct = timed([&] { kernels::probe_empty(kNodes, stream); });
+        double graph = -1;
+        {
+            DecodeGraphDefinition def;
+            def.capture(stream, [&] { kernels::probe_empty(kNodes, stream); });
+            DecodeGraphExecutable exe;
+            exe.instantiate(def);
+            exe.launch(stream);
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
+            graph = timed([&] { exe.launch(stream); });
+        }
+        std::string events = "ok";
+        try {
+            DecodeGraphDefinition def;
+            def.capture(stream, [&] {
+                CUDA_CHECK(cudaEventRecordWithFlags(a, stream, cudaEventRecordExternal));
+                kernels::probe_empty(kNodes, stream);
+                CUDA_CHECK(cudaEventRecordWithFlags(b, stream, cudaEventRecordExternal));
+            });
+            DecodeGraphExecutable exe;
+            exe.instantiate(def);
+            exe.launch(stream);
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
+            float ms = 0;
+            const cudaError_t err = cudaEventElapsedTime(&ms, a, b);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
+                events = std::string("refused (") + cudaGetErrorName(err) + ")";
+            } else {
+                events = "ok, " + std::to_string(int(std::lround(1000.0 * double(ms)))) +
+                         " us for the 1000 nodes between them";
+            }
+        } catch (const std::exception& error) {
+            (void)cudaGetLastError();
+            events = std::string("refused (") + error.what() + ")";
+        }
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        CUDA_CHECK(cudaEventDestroy(a));
+        CUDA_CHECK(cudaEventDestroy(b));
+        std::fprintf(stderr,
+                     "hp-probe: a graph of %d empty kernels: %.2f us/node (direct launches %.2f "
+                     "us/kernel); timed events inside a graph: %s\n",
+                     kNodes, 1000.0 * graph / kNodes, 1000.0 * direct / kNodes, events.c_str());
+        if (events.rfind("ok", 0) != 0 && options.cuda_graphs) {
+            options.cuda_graphs = false;
+            std::fprintf(stderr, "hp-probe: CUDA graphs off while the probe is on (the driver does "
+                                 "not time events recorded inside a graph)\n");
+        }
+    }
+
+    // At the start of a decode or verification call: the previous probed call's times, then this
+    // call's start (the wall time between two calls' starts, when nothing else ran between them).
+    void probe_read() {
+        if (probe_every <= 0) { return; }
+        const auto now = std::chrono::steady_clock::now();
+        if (probe_pending) {
+            probe_pending = false;
+            probe_collect(now);
+        }
+        probe_entry       = now;
+        probe_entry_valid = true;
+        if (probe_window >= std::uint64_t(probe_every)) { probe_report(); }
+    }
+
+    // A prompt call (or a short tail) ran: the next probed call's wall time and host records do
+    // not follow the last probed call.
+    void probe_break() { probe_entry_valid = false; }
+
+    void probe_count(std::uint64_t tokens) {
+        if (probe_every <= 0) { return; }
+        probe_tokens += tokens;
+        probe_window += tokens;
+    }
+
+    static int probe_class(const ExpertProbeRecord& r) {
+        return r.misses == 0 ? 0 : r.copied == 0 ? 1 : r.copied == 1 ? 2 : 3;
+    }
+
+    [[nodiscard]] int probe_part(const VisitPlan& vp) const {
+        if (vp.layer < config.core_start) { return 0; }
+        if (config.core(vp.layer)) { return 1 + int(std::min<std::uint32_t>(vp.pass, 2)); }
+        return 4;
+    }
+
+    void probe_collect(std::chrono::steady_clock::time_point now) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ProbeSums& S  = probe_sums;
+        CUDA_CHECK(cudaEventSynchronize(probe_events.back()));
+        const auto ms = [&](std::size_t a, std::size_t b) {
+            float x = 0;
+            const cudaError_t err = cudaEventElapsedTime(&x, probe_events[a], probe_events[b]);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
+                ++S.failures;
+                return 0.0;
+            }
+            return double(x);
+        };
+        const std::size_t V    = visits.size();
+        const std::size_t last = probe_events.size() - 1;
+        const double gpu       = ms(0, last);
+        ++S.calls;
+        S.rows += std::uint64_t(probe_rows);
+        S.gpu += gpu;
+        S.embed += ms(0, 1);
+        S.head += ms(1 + (V - 1) * kProbeMarks + 8, last);
+        // The host records of this call's narrow requests, one per visit of a host-expert layer,
+        // in visit order (only when no other call ran since).
+        std::size_t served = 0;
+        for (const VisitPlan& vp : visits) { served += layers[vp.layer].delivery_layer >= 0 ? 1 : 0; }
+        bool attributed = false;
+        if (delivery && probe_entry_valid && served > 0) {
+            probe_records.resize(served);
+            attributed = delivery->probe_records(probe_records) == served;
+            for (std::size_t v = 0, r = 0; attributed && v < V; ++v) {
+                if (layers[visits[v].layer].delivery_layer < 0) { continue; }
+                const ExpertProbeRecord& rec = probe_records[r++];
+                attributed = !rec.wide && rec.layer == std::uint32_t(layers[visits[v].layer].delivery_layer);
+            }
+        }
+        if (attributed) { ++S.attributed; }
+        for (std::size_t v = 0, r = 0; v < V; ++v) {
+            const std::size_t base = 1 + v * kProbeMarks;
+            const VisitPlan& vp    = visits[v];
+            double total           = 0;
+            double ph[kProbePhases];
+            for (int k = 0; k < kProbePhases; ++k) {
+                ph[k] = ms(base + std::size_t(k), base + std::size_t(k) + 1);
+                total += ph[k];
+                S.phase[k] += ph[k];
+                S.kind[vp.full ? 1 : 0][k] += ph[k];
+            }
+            ++S.kind_visits[vp.full ? 1 : 0];
+            if (v + 1 < V) { S.gaps += ms(base + 8, base + kProbeMarks); }
+            const int part = probe_part(vp);
+            S.part[part] += total;
+            ++S.part_visits[part];
+            if (!attributed || layers[vp.layer].delivery_layer < 0) { continue; }
+            const ExpertProbeRecord& rec = probe_records[r++];
+            const int cls = probe_class(rec);
+            ++S.class_visits[cls];
+            S.class_wait[cls] += ph[5];
+            S.class_misses[cls] += ph[6];
+            const double host[4]{1e-3 * double(rec.issued - rec.seen),
+                                 1e-3 * double(rec.cpu_done - rec.issued),
+                                 1e-3 * double(rec.copies_done - rec.cpu_done),
+                                 1e-3 * double(rec.prepared - rec.copies_done)};
+            for (int h = 0; h < 4; ++h) {
+                S.class_host[cls][h] += host[h];
+                S.host[h] += host[h];
+            }
+            ++S.records;
+            S.hits += rec.hits;
+            S.misses += rec.misses;
+            S.copied += rec.copied;
+            S.cpu += rec.cpu;
+            S.bytes += double(rec.bytes);
+        }
+        if (probe_entry_valid) {
+            ++S.walls;
+            S.wall += std::chrono::duration<double, std::milli>(now - probe_entry).count();
+            S.wall_gpu += gpu;
+        }
+        S.read += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    void probe_report() {
+        ProbeSums& S       = probe_sums;
+        const double tok   = double(std::max<std::uint64_t>(probe_window, 1));
+        const double calls = double(std::max<std::uint64_t>(S.calls, 1));
+        static constexpr const char* kPhase[kProbePhases] = {
+            "proj", "atencao", "saida+res", "router+split", "cache", "espera", "misses",
+            "residual"};
+        static constexpr const char* kPart[kProbeParts] = {"prelude", "loop1", "loop2", "loop3",
+                                                           "coda"};
+        static constexpr const char* kClass[kProbeClasses] = {"0 misses", "so CPU", "1 copia",
+                                                              ">=2 copias"};
+        double phases = 0;
+        for (const double p : S.phase) { phases += p; }
+        const double walls     = double(std::max<std::uint64_t>(S.walls, 1));
+        const double host_call = (S.wall - S.wall_gpu) / walls;
+        std::fprintf(stderr,
+                     "hp-probe: %llu tok (total %llu), %llu chamadas (%.2f linhas/chamada): GPU "
+                     "%.3f ms/tok (fases %.3f, embed %.3f, cabeca %.3f, entre visitas %.3f) | "
+                     "parede %.3f ms/chamada - GPU %.3f = intervalo do host %.3f ms/chamada "
+                     "(%.3f ms/tok; leitura da sonda %.3f ms/chamada)%s\n",
+                     (unsigned long long)probe_window, (unsigned long long)probe_tokens,
+                     (unsigned long long)S.calls, double(S.rows) / calls, S.gpu / tok,
+                     phases / tok, S.embed / tok, S.head / tok, S.gaps / tok, S.wall / walls,
+                     S.wall_gpu / walls, host_call, host_call * double(S.walls) / tok,
+                     S.read / calls, S.failures ? " (eventos por ler!)" : "");
+        std::string line = "hp-probe: fases ms/tok:";
+        char buf[160];
+        for (int k = 0; k < kProbePhases; ++k) {
+            std::snprintf(buf, sizeof buf, " %s %.3f", kPhase[k], S.phase[k] / tok);
+            line += buf;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        for (int f = 0; f < 2; ++f) {
+            std::snprintf(buf, sizeof buf, "hp-probe: %s (%.1f visitas/chamada) ms/tok:",
+                          f ? "full" : "sliding", double(S.kind_visits[f]) / calls);
+            line = buf;
+            for (int k = 0; k < kProbePhases; ++k) {
+                std::snprintf(buf, sizeof buf, " %s %.3f", kPhase[k], S.kind[f][k] / tok);
+                line += buf;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
+        line = "hp-probe: por passagem ms/tok (ms/visita):";
+        for (int p = 0; p < kProbeParts; ++p) {
+            std::snprintf(buf, sizeof buf, " %s %.3f (%.3f)", kPart[p], S.part[p] / tok,
+                          S.part[p] / double(std::max<std::uint64_t>(S.part_visits[p], 1)));
+            line += buf;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+        if (S.records > 0) {
+            const double att = double(std::max<std::uint64_t>(S.attributed, 1));
+            line = "hp-probe: classes (visitas/chamada; espera e misses ms/visita; host "
+                   "visto>emitido>CPU>copias>prepared us):";
+            for (int c = 0; c < kProbeClasses; ++c) {
+                const double n = double(std::max<std::uint64_t>(S.class_visits[c], 1));
+                std::snprintf(buf, sizeof buf, " | %s %.2f: espera %.3f misses %.3f host %.0f/%.0f/%.0f/%.0f",
+                              kClass[c], double(S.class_visits[c]) / att, S.class_wait[c] / n,
+                              S.class_misses[c] / n, S.class_host[c][0] / n, S.class_host[c][1] / n,
+                              S.class_host[c][2] / n, S.class_host[c][3] / n);
+                line += buf;
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+            const double r = double(S.records);
+            std::fprintf(stderr,
+                         "hp-probe: host por visita (%llu de %llu chamadas): acertos %.2f misses %.2f "
+                         "copiados %.2f CPU %.2f, %.0f KiB; visto>emitido %.0f us, >CPU feito %.0f, "
+                         ">copias feitas %.0f, >prepared %.0f\n",
+                         (unsigned long long)S.attributed, (unsigned long long)S.calls,
+                         S.hits / r, S.misses / r, S.copied / r, S.cpu / r, S.bytes / r / 1024.0,
+                         S.host[0] / r, S.host[1] / r, S.host[2] / r, S.host[3] / r);
+        }
+        S            = ProbeSums{};
+        probe_window = 0;
+    }
+
     // ---- Decode ----------------------------------------------------------------------------------
 
     // One token per row; tokens, positions and sequences already staged on the device. With
@@ -3026,6 +3368,14 @@ struct Executor::Impl {
         c.rows.tokens    = b;
         c.plane          = std::int64_t(b) * hidden;
         c.spark_rows     = b;
+        // hp-tune (probe): this call's phases, its start and after its head.
+        if (probe_every > 0) {
+            cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+            c.probe         = true;
+            c.probe_capture = capturing == cudaStreamCaptureStatusActive;
+            probe_record(c, 0);
+        }
         run_with_taps(c, {}, 0, spine ? b : 0);
         if (c.q8) {
             head_logits_q8(c.ffn_q, b, b);
@@ -3036,10 +3386,12 @@ struct Executor::Impl {
             spine->commit_rows(Tensor(d_sequences.p, DType::I32, {b}),
                                Tensor(d_positions.p, DType::I32, {b}), 0, stream);
         }
+        if (c.probe) { probe_record(c, probe_events.size() - 1); }
     }
 
     template <typename Body>
     void run_graph(std::uint32_t key, Body&& body) {
+        if (key >= kShortGraphs) { probe_break(); } // hp-tune (probe): a short tail's slice
         if (!options.cuda_graphs) {
             body();
             return;
@@ -3076,11 +3428,15 @@ struct Executor::Impl {
             pos[i] = std::int32_t(positions[sequences[i]]);
             seq[i] = std::int32_t(sequences[i]);
         }
+        probe_read();
         narrow();
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1); }
         stage(tokens, pos, seq);
         run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
+        probe_pending = probe_every > 0;
+        probe_rows    = b;
+        probe_count(std::uint64_t(b));
     }
 
     // ---- hp-tune (T1): short prompt tails by the decode path --------------------------------------
@@ -3182,6 +3538,7 @@ struct Executor::Impl {
                 seq[at] = std::int32_t(s);
             }
         }
+        probe_read();
         narrow();
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
@@ -3189,6 +3546,8 @@ struct Executor::Impl {
         run_graph(16 + std::uint32_t(rows),
                   [&] { decode_body(rows, false, std::min(rows, kernels::kMaxRowGroup)); });
         verify_widths = std::move(row_widths);
+        probe_pending = probe_every > 0;
+        probe_rows    = rows;
     }
 
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
@@ -3207,6 +3566,7 @@ struct Executor::Impl {
                 spine->commit(spine->lane(s), positions[s], std::uint32_t(column), kept[j], stream);
             }
             positions[s] += kept[j];
+            probe_count(kept[j]);
         }
         verify_widths.clear();
     }
@@ -3239,6 +3599,7 @@ struct Executor::Impl {
     }
 
     void warm_up() {
+        if (probe_every > 0) { probe_calibrate(); }
         if (spine) { spine->prepare(stream); }
         if (spark) { prepare_spark(); }
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
@@ -3293,6 +3654,12 @@ struct Executor::Impl {
             }
         }
         CUDA_CHECK(ninfer::wait_for_stream(stream));
+        if (probe_every > 0) {
+            // hp-tune (probe): the warm-up's calls are not counted.
+            probe_pending = probe_entry_valid = false;
+            probe_sums    = ProbeSums{};
+            probe_tokens = probe_window = 0;
+        }
         if (delivery) {
             delivery->drain();
             delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);

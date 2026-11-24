@@ -493,4 +493,7 @@ void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
                std::int64_t n, cudaStream_t stream);
 
+// hp-tune (probe): `count` launches of an empty one-thread kernel (a graph of them prices a node).
+void probe_empty(int count, cudaStream_t stream);
+
 } // namespace ninfer::models::inkling2::kernels

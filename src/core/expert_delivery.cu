@@ -420,6 +420,17 @@ struct ExpertDelivery::Impl {
     std::uint64_t loop_tokens = 0, loop_forced = 0;
     std::int64_t loop_visit = -1; // the served call's visit of its loop layer this token
     LoopCounts loop_counts[3];
+    // hp-tune (probe): the served calls' ring (probe_count records published so far) and the
+    // record of the call being served.
+    static constexpr std::size_t kProbeRing = 1024;
+    bool probe_on = false;
+    std::vector<ExpertProbeRecord> probe_ring;
+    std::atomic<std::uint64_t> probe_count{0};
+    ExpertProbeRecord probe_now;
+    static std::int64_t probe_clock(std::chrono::steady_clock::time_point at) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count();
+    }
+    static std::int64_t probe_clock() { return probe_clock(std::chrono::steady_clock::now()); }
     // hp-tune (miss-skip): the environment's limits (skip.weights stays null) and, over narrow
     // calls, the experts dropped, the misses before dropping and the routes before dropping;
     // a narrow call to layer 0 starts a pass, reported every 256.
@@ -1894,6 +1905,7 @@ struct ExpertDelivery::Impl {
         work.products = static_cast<std::byte*>(host_products->data());
         work.pool     = pool.get();
         const auto [used, microseconds] = options.cpu.products->compute(work);
+        if (probe_on) { probe_now.cpu_done = probe_clock(); }
         if (used > options.cpu.product_bytes) {
             throw std::logic_error("expert delivery: CPU products exceed their buffer");
         }
@@ -1958,6 +1970,15 @@ struct ExpertDelivery::Impl {
         }
         delta.routes = routes;
         const bool wide = 2 * routes >= std::uint32_t(experts);
+        if (probe_on) {
+            probe_now          = {};
+            probe_now.sequence = request.sequence;
+            probe_now.layer    = std::uint32_t(li);
+            probe_now.routes   = routes;
+            probe_now.hits     = std::uint32_t(delta.hits);
+            probe_now.wide     = wide;
+            probe_now.seen     = probe_clock(started);
+        }
         if (skip_on && !wide) {
             // hp-tune (miss-skip): the dropped experts were misses and routes before the split.
             if (li == 0 && ++skip_passes % 256 == 0) {
@@ -2038,6 +2059,7 @@ struct ExpertDelivery::Impl {
                         slot_written(slot, b, blob.bytes);
                     }
                     ++delta.admissions;
+                    ++probe_now.copied;
                     point_slot(li, e, slot);
                     continue;
                 }
@@ -2050,6 +2072,7 @@ struct ExpertDelivery::Impl {
                 }
                 lent_taken.push_back(l);
                 admit_lent(l, li, e, delta);
+                ++probe_now.copied;
                 continue;
             }
             to_bank.push_back(e);
@@ -2087,6 +2110,7 @@ struct ExpertDelivery::Impl {
             if (timed) { CUDA_CHECK(cudaEventRecord(copies_begun, copies)); }
             flush_pieces(delta);
             if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
+            if (probe_on) { probe_now.issued = probe_now.cpu_done = probe_clock(); }
             learn();
         };
         if (layer.cpu && host_flag) {
@@ -2101,6 +2125,13 @@ struct ExpertDelivery::Impl {
         }
         upload_tables();
         CUDA_CHECK(ninfer::wait_for_stream(copies));
+        if (probe_on) {
+            probe_now.copies_done = probe_clock();
+            probe_now.copied += std::uint32_t(to_bank.size());
+            probe_now.misses = std::uint32_t(delta.misses);
+            probe_now.cpu    = std::uint32_t(cpu.size());
+            probe_now.bytes  = delta.copied_bytes - copied_before;
+        }
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -2224,6 +2255,14 @@ struct ExpertDelivery::Impl {
             bool served_ok = false;
             try { check(); serve(*request); served_ok = true; }
             catch (...) { fail(&*request); }
+            if (probe_on && served_ok) {
+                // hp-tune (probe): published before the ready signal, so a reader after the
+                // compute stream's last call finds every call's record.
+                probe_now.prepared = probe_clock();
+                const std::uint64_t n = probe_count.load(std::memory_order_relaxed);
+                probe_ring[std::size_t(n % kProbeRing)] = probe_now;
+                probe_count.store(n + 1, std::memory_order_release);
+            }
             handshake->prepared(request->sequence);
             served = request->sequence;
             if (served_ok) {
@@ -2631,6 +2670,20 @@ void ExpertDelivery::set_keep_free_bytes(std::uint64_t bytes) {
     impl_->options.keep_free_bytes = bytes;
 }
 
+void ExpertDelivery::probe(bool on) {
+    auto& p = *impl_;
+    if (on && p.probe_ring.empty()) { p.probe_ring.resize(Impl::kProbeRing); }
+    p.probe_on = on;
+}
+std::size_t ExpertDelivery::probe_records(std::span<ExpertProbeRecord> out) const {
+    const auto& p        = *impl_;
+    const std::uint64_t n = p.probe_count.load(std::memory_order_acquire);
+    const std::uint64_t k = std::min<std::uint64_t>({n, out.size(), Impl::kProbeRing});
+    for (std::uint64_t i = 0; i < k; ++i) {
+        out[std::size_t(i)] = p.probe_ring[std::size_t((n - k + i) % Impl::kProbeRing)];
+    }
+    return std::size_t(k);
+}
 std::string ExpertDelivery::cpu_description() const {
     if (!impl_->pool) { return {}; }
     return std::to_string(impl_->pool->threads()) +
