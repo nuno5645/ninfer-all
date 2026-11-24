@@ -1,8 +1,8 @@
-name: HP build (sm_75)
+name: HP build (sm_75 + sm_86)
 on:
   workflow_dispatch:
   push:
-    branches: [hp-tune]
+    branches: [hp-tune, hp-3060]
 permissions:
   contents: read
 jobs:
@@ -26,7 +26,7 @@ jobs:
       CCACHE_MAXSIZE: 4G
       CCACHE_COMPILERCHECK: content
       CUDA_VERSION: 12.9.2
-      ARCHS: "75"
+      ARCHS: "75;86"
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
     steps:
