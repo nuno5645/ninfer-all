@@ -199,6 +199,8 @@ public:
     }
     [[nodiscard]] const std::optional<DSparkWeights>& dspark() const noexcept { return dspark_; }
     [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
+    // hp-tune (E1, NINFER_INK_EMBED_HOST=1): the token table lies in pinned host memory.
+    [[nodiscard]] bool embedding_on_host() const noexcept { return embedding_host_; }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
@@ -230,6 +232,7 @@ private:
     std::optional<DSparkConfig> dspark_config_;
     std::optional<DSparkWeights> dspark_;
     std::unique_ptr<dspine::Model> dspine_;
+    bool embedding_host_ = false;
 };
 
 // Whether the artifact's text component is Inkling 2, and whether it carries the vision tower and

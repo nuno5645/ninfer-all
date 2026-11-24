@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -231,10 +233,32 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         return b.direct(name, std::move(shape), QType::FP32);
     };
     TextWeights weights;
-    weights.token_embedding = b.parameter("text/token_embedding", {config.vocab_size, h});
+    // hp-tune (E1): NINFER_INK_EMBED_HOST=1 keeps the token table in pinned host memory (the
+    // executor copies each call's rows to the device); the drafters read it on the device.
+    const char* embed_env   = std::getenv("NINFER_INK_EMBED_HOST");
+    const bool embed_host   = embed_env != nullptr && std::atoi(embed_env) == 1;
+    if (embed_host && (options.dspark || !options.dspine.empty())) {
+        throw std::invalid_argument("NINFER_INK_EMBED_HOST=1 (hp-tune E1): not with --spec dspark "
+                                    "or dspine, whose drafters read the token table on the device");
+    }
+    weights.token_embedding = b.parameter("text/token_embedding", {config.vocab_size, h}, {},
+                                          std::nullopt,
+                                          embed_host ? artifact::Residency::Pinned
+                                                     : artifact::Residency::Device);
     weights.embedding_norm  = vector("text/embedding_norm", {h});
     weights.output_head     = b.parameter("text/output_head", {config.vocab_size, h},
                                           {"text/final_hidden"});
+    if (embed_host) {
+        // A head stored in the table's own object keeps that object on the device: no VRAM freed.
+        for (const auto& t : b.at(weights.token_embedding).reference.binding.parts) {
+            for (const auto& o : b.at(weights.output_head).reference.binding.parts) {
+                if (t.object.index == o.object.index) {
+                    std::fprintf(stderr, "hp-tune: E1 the output head shares the token table's "
+                                         "stored object: it stays on the device as well\n");
+                }
+            }
+        }
+    }
     weights.final_norm      = vector("text/final_norm", {h});
     weights.output_mix      = vector("text/output_mix", {h});
     tail(b, weights.output_head);
@@ -458,6 +482,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->vision_placement_ = options.vision;
     model->dspark_config_    = std::move(dspark_config);
     model->dspark_           = std::move(dspark);
+    model->embedding_host_   = embed_host;
     if (options.experts == ExpertResidency::Disk || model->expert_file_bytes() > 0) {
         for (const auto& file : reader.directory().files) {
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path

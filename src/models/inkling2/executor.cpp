@@ -275,6 +275,15 @@ struct Executor::Impl {
     Weight embedding, head, head_tiles;
     // A model with BF16 matrices runs every call on BF16 rows: the BF16 products read no q8_1 form.
     bool bf16_rows = false;
+    // hp-tune (E1, NINFER_INK_EMBED_HOST=1): the token table lies in pinned host memory. stage()
+    // gathers a call's rows (row_bytes each) into embed_staging and copies them to embed_rows,
+    // outside any graph; embed() reads them through embed_device (the table's format over
+    // embed_rows) at the ids embed_ids (0, 1, ...).
+    bool embed_host = false;
+    Weight embed_device;
+    DeviceBuffer embed_rows, embed_ids;
+    std::unique_ptr<PinnedHostBuffer> embed_staging;
+    std::size_t embed_row_bytes = 0;
     const float *embedding_norm = nullptr, *final_norm = nullptr, *output_mix = nullptr;
     std::vector<std::uint32_t> positions;
     // The position at which each sequence's rings last came whole from a prompt, a checkpoint or
@@ -422,6 +431,7 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 executor: DSpine drafting needs the model's "
                                         "drafter and 1 to its block less one drafts a round");
         }
+        if (model.embedding_on_host()) { plan_embed_host(); }
         const auto schedule  = config.visits();
         const int sequences  = int(options.sequences);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
@@ -638,6 +648,43 @@ struct Executor::Impl {
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
         plan_probe();
+    }
+
+    // hp-tune (E1): the device rows of a call's tokens beside a token table in host memory.
+    void plan_embed_host() {
+        if (options.dspark || options.dspine) {
+            throw std::invalid_argument("NINFER_INK_EMBED_HOST=1 (hp-tune E1): not with --spec "
+                                        "dspark or dspine, whose drafters read the token table on "
+                                        "the device");
+        }
+        cudaPointerAttributes where{};
+        CUDA_CHECK(cudaPointerGetAttributes(&where, embedding.qdata));
+        const bool host = where.type == cudaMemoryTypeHost;
+        if (!host) {
+            std::fprintf(stderr, "hp-tune: E1 the token table is not in host memory (type %d): "
+                                 "embedding from the device\n", int(where.type));
+            return;
+        }
+        embed_host      = true;
+        embed_row_bytes = std::size_t(row_bytes(embedding));
+        const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, options.sequences);
+        embed_rows    = DeviceBuffer(rows * embed_row_bytes);
+        embed_ids     = DeviceBuffer(rows * 4);
+        embed_staging = std::make_unique<PinnedHostBuffer>(rows * embed_row_bytes);
+        std::vector<std::int32_t> ids(rows);
+        std::iota(ids.begin(), ids.end(), 0);
+        embed_ids.copy_from_host(ids.data(), rows * 4);
+        embed_device       = embedding;
+        embed_device.qdata = embed_rows.p;
+        embed_device.n     = int(rows);
+        const double table = double(embed_row_bytes) * double(embedding.n) / 1048576.0;
+        std::fprintf(stderr,
+                     "hp-tune: E1 token table in pinned host memory: %d x %d, QType %d, %zu bytes "
+                     "a row (%.2f bits a value), %.1f MiB off the device; device rows %.2f MiB "
+                     "(%zu rows)\n",
+                     embedding.n, embedding.k, int(embedding.qtype), embed_row_bytes,
+                     8.0 * double(embed_row_bytes) / double(embedding.k), table,
+                     double(rows * embed_row_bytes) / 1048576.0, rows);
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -2085,6 +2132,21 @@ struct Executor::Impl {
         std::copy(b.begin(), b.end(), host + rows);
         std::copy(c.begin(), c.end(), host + 2 * rows);
         std::copy(g.begin(), g.end(), host + 3 * rows);
+        if (embed_host && !a.empty()) {
+            // hp-tune (E1): the tokens' table rows, gathered on the host, in one copy; the staged
+            // event below orders the next gather after it.
+            auto* rows_host     = static_cast<std::byte*>(embed_staging->data());
+            const auto* table   = static_cast<const std::byte*>(embedding.qdata);
+            for (std::size_t i = 0; i < a.size(); ++i) {
+                if (a[i] < 0 || a[i] >= embedding.n) {
+                    throw std::invalid_argument("inkling2 executor: a token outside the table");
+                }
+                std::memcpy(rows_host + i * embed_row_bytes,
+                            table + std::size_t(a[i]) * embed_row_bytes, embed_row_bytes);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(embed_rows.p, rows_host, a.size() * embed_row_bytes,
+                                       cudaMemcpyHostToDevice, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(d_tokens.p, host, a.size() * 4, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_positions.p, host + rows, b.size() * 4,
                                    cudaMemcpyHostToDevice, stream));
@@ -2293,7 +2355,14 @@ struct Executor::Impl {
         States& s = c.states;
         s.cur     = 0;
         float* h  = s.buffers[0];
-        table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), c.t, h, hidden, stream);
+        if (embed_host) {
+            // hp-tune (E1): the rows stage() copied, in token order.
+            table_rows(embed_device, static_cast<const std::int32_t*>(embed_ids.p), c.t, h, hidden,
+                       stream);
+        } else {
+            table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), c.t, h, hidden,
+                       stream);
+        }
         kernels::rms_norm(h, embedding_norm, hidden, c.t, eps, nullptr, stream, {}, h);
         // A piece at a time through the device rows, each copy ordered after the placement before.
         for (const ImageRows& piece : images) {
@@ -3665,6 +3734,17 @@ struct Executor::Impl {
             delivery->prime(options.expert_profile ? &*options.expert_profile : nullptr);
             std::lock_guard lock(expert_stats_mutex);
             expert_startup_stats = delivery->stats();
+        }
+        if (embed_host && delivery) {
+            // hp-tune (E1): what the expert cache holds with the table off the device.
+            const auto m      = delivery->memory();
+            const double slot = m.cache_slots ? double(m.cache_bytes) / double(m.cache_slots) : 0;
+            const double table = double(embed_row_bytes) * double(embedding.n);
+            std::fprintf(stderr,
+                         "hp-tune: E1 expert cache %llu MiB, %u slots of %.2f MiB: the table's "
+                         "%.1f MiB are about %.0f of them\n",
+                         (unsigned long long)(m.cache_bytes >> 20), unsigned(m.cache_slots),
+                         slot / 1048576.0, table / 1048576.0, slot > 0 ? table / slot : 0.0);
         }
         if (options.workspace_chunk != 0) {
             const auto m = delivery ? delivery->memory() : ExpertDeliveryMemory{};
