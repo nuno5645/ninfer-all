@@ -431,6 +431,67 @@ struct ExpertDelivery::Impl {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count();
     }
     static std::int64_t probe_clock() { return probe_clock(std::chrono::steady_clock::now()); }
+    // hp-tune (N11''): the guess area (mapped host memory, per layer 1 + guess_rows * guess_width
+    // words), its device address, and the counts (under `mutex`).
+    std::unique_ptr<PinnedHostBuffer> guess_host;
+    void* guess_mapped        = nullptr;
+    std::uint32_t guess_rows  = 0, guess_width = 0;
+    ExpertGuessStats guess_counts;
+    std::vector<unsigned char> guess_seen;
+
+    // A narrow call of layer li, before its misses are placed: the guess its layer holds against
+    // the call's routes (needed) and the residency its split saw.
+    void count_guess(std::size_t li, const std::uint32_t* needed) {
+        const std::size_t stride = 1 + std::size_t(guess_rows) * guess_width;
+        auto* slot = static_cast<volatile std::int32_t*>(guess_host->data()) + li * stride;
+        const std::int32_t rows = slot[0];
+        if (rows <= 0 || std::uint32_t(rows) > guess_rows) { return; }
+        slot[0] = 0;
+        const auto& layer = layers[li];
+        const int experts = int(layer.source.experts.size());
+        ExpertGuessStats d;
+        d.calls = 1;
+        for (int e = 0; e < experts; ++e) {
+            if (!call_routed[std::size_t(e)]) { continue; }
+            ++d.routes;
+            if (needed[e] & kMiss) { ++d.misses; }
+        }
+        const std::uint32_t widths[2]{std::min<std::uint32_t>(8, guess_width), guess_width};
+        for (int m = 0; m < 2; ++m) {
+            guess_seen.assign(std::size_t(experts), 0);
+            for (std::int32_t r = 0; r < rows; ++r) {
+                for (std::uint32_t j = 0; j < widths[m]; ++j) {
+                    const std::int32_t e = slot[1 + std::size_t(r) * guess_width + j];
+                    if (e < 0 || e >= experts || guess_seen[std::size_t(e)]) { continue; }
+                    guess_seen[std::size_t(e)] = 1;
+                    const bool routed = call_routed[std::size_t(e)] != 0;
+                    const auto s      = layer.slot_of[std::size_t(e)];
+                    const bool resident =
+                        routed ? (needed[e] & kHit) != 0
+                               : (s >= 0 && !slots[std::size_t(s)].pending) ||
+                                     layer.lent_of[std::size_t(e)] >= 0;
+                    if (routed) {
+                        ++d.routes_in[m];
+                        if (needed[e] & kMiss) { ++d.misses_in[m]; }
+                    }
+                    if (!resident) {
+                        ++d.open[m];
+                        if (routed) { ++d.open_routed[m]; }
+                    }
+                }
+            }
+        }
+        std::lock_guard lock(mutex);
+        guess_counts.calls += d.calls;
+        guess_counts.routes += d.routes;
+        guess_counts.misses += d.misses;
+        for (int m = 0; m < 2; ++m) {
+            guess_counts.routes_in[m] += d.routes_in[m];
+            guess_counts.misses_in[m] += d.misses_in[m];
+            guess_counts.open[m] += d.open[m];
+            guess_counts.open_routed[m] += d.open_routed[m];
+        }
+    }
     // hp-tune (miss-skip): the environment's limits (skip.weights stays null) and, over narrow
     // calls, the experts dropped, the misses before dropping and the routes before dropping;
     // a narrow call to layer 0 starts a pass, reported every 256.
@@ -1979,6 +2040,7 @@ struct ExpertDelivery::Impl {
             probe_now.wide     = wide;
             probe_now.seen     = probe_clock(started);
         }
+        if (guess_host && !wide) { count_guess(li, needed); } // hp-tune (N11'')
         if (skip_on && !wide) {
             // hp-tune (miss-skip): the dropped experts were misses and routes before the split.
             if (li == 0 && ++skip_passes % 256 == 0) {
@@ -2683,6 +2745,26 @@ std::size_t ExpertDelivery::probe_records(std::span<ExpertProbeRecord> out) cons
         out[std::size_t(i)] = p.probe_ring[std::size_t((n - k + i) % Impl::kProbeRing)];
     }
     return std::size_t(k);
+}
+void ExpertDelivery::enable_guess(std::uint32_t rows, std::uint32_t width) {
+    auto& p = *impl_;
+    if (rows == 0 || width == 0) { throw std::invalid_argument("expert delivery: an empty guess"); }
+    const std::size_t words = p.layers.size() * (1 + std::size_t(rows) * width);
+    p.guess_host            = std::make_unique<PinnedHostBuffer>(words * 4);
+    std::memset(p.guess_host->data(), 0, words * 4);
+    CUDA_CHECK(cudaHostGetDevicePointer(&p.guess_mapped, p.guess_host->data(), 0));
+    p.guess_rows  = rows;
+    p.guess_width = width;
+}
+std::int32_t* ExpertDelivery::guess_slot(std::size_t layer) const {
+    const auto& p = *impl_;
+    if (!p.guess_host || layer >= p.layers.size()) { return nullptr; }
+    return static_cast<std::int32_t*>(p.guess_mapped) +
+           layer * (1 + std::size_t(p.guess_rows) * p.guess_width);
+}
+ExpertGuessStats ExpertDelivery::guess_stats() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->guess_counts;
 }
 std::string ExpertDelivery::cpu_description() const {
     if (!impl_->pool) { return {}; }

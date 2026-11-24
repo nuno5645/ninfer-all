@@ -496,4 +496,11 @@ void add_fixed(unsigned long long* sums, const void* products, const std::int32_
 // hp-tune (probe): `count` launches of an empty one-thread kernel (a graph of them prices a node).
 void probe_empty(int count, cudaStream_t stream);
 
+// hp-tune (N11'' measurement): each of `rows` (<= 8) rows' `m` (<= 32) best experts of FP32 logits
+// [rows][experts] (experts <= 256) by sigmoid(logit) + bias[e], ranked as route() ranks them (ties
+// to the lower id), into out[1 + row * m + j], best first; then, after a system fence, out[0] =
+// rows (out may be mapped host memory, which the host reads once out[0] is set).
+void guess_experts(const float* logits, const float* bias, int rows, int experts, int m,
+                   std::int32_t* out, cudaStream_t stream);
+
 } // namespace ninfer::models::inkling2::kernels

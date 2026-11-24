@@ -339,6 +339,16 @@ struct Executor::Impl {
         double hits = 0, misses = 0, copied = 0, cpu = 0, bytes = 0, host[4]{};
     };
     ProbeSums probe_sums;
+    // hp-tune (N11'' measurement, NINFER_INK_GUESS_STATS=1): before visit v's experts, on
+    // guess_stream, visit v + 1's router over v's MoE input and its kGuessWidth best experts a
+    // row into the delivery's guess area; the service thread scores them at visit v + 1's call.
+    static constexpr int kGuessWidth = 12;
+    bool guess_stats = false;
+    cudaStream_t guess_stream = nullptr;
+    cudaEvent_t guess_fork = nullptr, guess_done = nullptr;
+    DeviceBuffer guess_logits;
+    std::uint64_t guess_tokens = 0, guess_next = 256;
+    ExpertGuessStats guess_last{};
     std::unique_ptr<dspine::Runtime> spine;
     std::unique_ptr<Spark> spark;
     // The vision tower and its buffers: an image's patches, a span's rows.
@@ -648,6 +658,24 @@ struct Executor::Impl {
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
         plan_probe();
+        plan_guess();
+    }
+
+    void plan_guess() {
+        const char* e = std::getenv("NINFER_INK_GUESS_STATS");
+        if (e == nullptr || std::atoi(e) != 1) { return; }
+        if (!delivery || model.expert_parallel() || bf16_rows) {
+            std::fprintf(stderr, "hp-guess: off (host experts with q8_1 decode calls only)\n");
+            return;
+        }
+        guess_stats = true;
+        delivery->enable_guess(std::uint32_t(gguf::kMaxVectorColumns), kGuessWidth);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&guess_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_done, cudaEventDisableTiming));
+        guess_logits = DeviceBuffer(std::size_t(gguf::kMaxVectorColumns) * config.num_experts * 4);
+        std::fprintf(stderr, "hp-guess: on: each decode visit's router guesses the next visit's "
+                             "experts (m = 8 and %d), scored every 256 tokens\n", kGuessWidth);
     }
 
     // hp-tune (E1): the device rows of a call's tokens beside a token table in host memory.
@@ -1662,6 +1690,12 @@ struct Executor::Impl {
             ninfer::wait_for_stream(stream);
             for (cudaEvent_t ev : probe_events) { cudaEventDestroy(ev); }
         }
+        if (guess_stream != nullptr) {
+            ninfer::wait_for_stream(guess_stream);
+            cudaStreamDestroy(guess_stream);
+            cudaEventDestroy(guess_fork);
+            cudaEventDestroy(guess_done);
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -2203,6 +2237,9 @@ struct Executor::Impl {
         bool probe = false, probe_capture = false;
         std::size_t probe_visit = 0;
         int probe_next = 0;
+        // hp-tune (N11''): a decode or verification call that guesses each next visit's experts;
+        // the guess stream has work of this visit to join.
+        bool guess = false, guess_open = false;
     };
 
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
@@ -2750,8 +2787,14 @@ struct Executor::Impl {
         ra.cur     = s.buffers[s.cur];
         ra.hidden  = hidden;
         ra.mix.split = c.split;
+        if (c.guess && v + 1 < visits.size()) { guess_ahead(c, v + 1); } // hp-tune (N11'')
         experts(lp, c, ra);
         probe_mark(c, v, 7);
+        if (c.guess_open) {
+            // The guess read c.ffn_f32, which the next visit's attention residual rewrites.
+            CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
+            c.guess_open = false;
+        }
         const bool last = v + 1 == visits.size();
         if (last) {
             ra.mix = output_mix_args(c);
@@ -2765,6 +2808,59 @@ struct Executor::Impl {
             kernels::keep_products(ra, begin, end, stream);
         }
         probe_mark(c, v, 8);
+    }
+
+    // hp-tune (N11''): visit w's router over the MoE input of the visit before (c.ffn_f32) on the
+    // guess stream, its best experts a row into the delivery's guess area of w's layer.
+    void guess_ahead(Call& c, std::size_t w) {
+        const LayerPlan& np = layers[visits[w].layer];
+        if (np.delivery_layer < 0) { return; }
+        const int e  = int(config.num_experts);
+        auto* logits = static_cast<float*>(guess_logits.p);
+        CUDA_CHECK(cudaEventRecord(guess_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(guess_stream, guess_fork, 0));
+        kernels::gemm_f32(e, c.t, hidden, np.router, c.ffn_f32, logits, guess_stream);
+        kernels::guess_experts(logits, np.router_bias, c.t, e, kGuessWidth,
+                               delivery->guess_slot(std::size_t(np.delivery_layer)), guess_stream);
+        CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
+        c.guess_open = true;
+    }
+
+    // hp-tune (N11''): tokens decoded or committed; every 256 the guesses' scores since the last.
+    void guess_count(std::uint64_t tokens) {
+        if (!guess_stats) { return; }
+        guess_tokens += tokens;
+        if (guess_tokens < guess_next) { return; }
+        guess_next = guess_tokens + 256;
+        const ExpertGuessStats now = delivery->guess_stats();
+        ExpertGuessStats d;
+        d.calls  = now.calls - guess_last.calls;
+        d.routes = now.routes - guess_last.routes;
+        d.misses = now.misses - guess_last.misses;
+        for (int m = 0; m < 2; ++m) {
+            d.routes_in[m]   = now.routes_in[m] - guess_last.routes_in[m];
+            d.misses_in[m]   = now.misses_in[m] - guess_last.misses_in[m];
+            d.open[m]        = now.open[m] - guess_last.open[m];
+            d.open_routed[m] = now.open_routed[m] - guess_last.open_routed[m];
+        }
+        guess_last = now;
+        const double visits_n = double(std::max<std::uint64_t>(d.calls, 1));
+        const auto pct = [](std::uint64_t a, std::uint64_t b) {
+            return 100.0 * double(a) / double(std::max<std::uint64_t>(b, 1));
+        };
+        std::fprintf(stderr,
+                     "hp-guess: %llu tok, %llu visitas com palpite (%.2f rotas, %.3f misses por "
+                     "visita) | m=8: recall dos misses %.1f%%, rotas cobertas %.1f%%, precisao "
+                     "%.1f%% (%.2f palpites fora da cache por visita, %.3f roteados) | m=%d: recall "
+                     "%.1f%%, rotas %.1f%%, precisao %.1f%% (%.2f fora, %.3f roteados)\n",
+                     (unsigned long long)guess_tokens, (unsigned long long)d.calls,
+                     double(d.routes) / visits_n, double(d.misses) / visits_n,
+                     pct(d.misses_in[0], d.misses), pct(d.routes_in[0], d.routes),
+                     pct(d.open_routed[0], d.open[0]), double(d.open[0]) / visits_n,
+                     double(d.open_routed[0]) / visits_n, kGuessWidth,
+                     pct(d.misses_in[1], d.misses), pct(d.routes_in[1], d.routes),
+                     pct(d.open_routed[1], d.open[1]), double(d.open[1]) / visits_n,
+                     double(d.open_routed[1]) / visits_n);
     }
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
@@ -3445,6 +3541,7 @@ struct Executor::Impl {
             c.probe_capture = capturing == cudaStreamCaptureStatusActive;
             probe_record(c, 0);
         }
+        c.guess = guess_stats && c.q8; // hp-tune (N11'')
         run_with_taps(c, {}, 0, spine ? b : 0);
         if (c.q8) {
             head_logits_q8(c.ffn_q, b, b);
@@ -3506,6 +3603,7 @@ struct Executor::Impl {
         probe_pending = probe_every > 0;
         probe_rows    = b;
         probe_count(std::uint64_t(b));
+        guess_count(std::uint64_t(b));
     }
 
     // ---- hp-tune (T1): short prompt tails by the decode path --------------------------------------
@@ -3636,6 +3734,7 @@ struct Executor::Impl {
             }
             positions[s] += kept[j];
             probe_count(kept[j]);
+            guess_count(kept[j]);
         }
         verify_widths.clear();
     }
@@ -3728,6 +3827,12 @@ struct Executor::Impl {
             probe_pending = probe_entry_valid = false;
             probe_sums    = ProbeSums{};
             probe_tokens = probe_window = 0;
+        }
+        if (guess_stats) {
+            // hp-tune (N11''): the warm-up's guesses are not counted.
+            guess_last   = delivery->guess_stats();
+            guess_tokens = 0;
+            guess_next   = 256;
         }
         if (delivery) {
             delivery->drain();

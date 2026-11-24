@@ -3430,4 +3430,38 @@ void probe_empty(int count, cudaStream_t stream) {
     check_launch("probe_empty");
 }
 
+// One block, thread e the expert; the rows one after another.
+__global__ void guess_experts_kernel(const float* logits, const float* bias, int rows, int experts,
+                                     int m, std::int32_t* out) {
+    __shared__ float selections[kRouteThreads];
+    const int e = int(threadIdx.x);
+    for (int t = 0; t < rows; ++t) {
+        const float logit     = e < experts ? logits[std::int64_t(t) * experts + e] : 0.0f;
+        const float selection = e < experts ? sigmoidf(logit) + bias[e] : -INFINITY;
+        selections[e]         = selection;
+        __syncthreads();
+        if (e < experts) {
+            int rank = 0;
+            for (int j = 0; j < experts && rank < m; ++j) {
+                const float other = selections[j];
+                rank += other > selection || (other == selection && j < e) ? 1 : 0;
+            }
+            if (rank < m) { out[1 + t * m + rank] = e; }
+        }
+        __syncthreads();
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) { *reinterpret_cast<volatile std::int32_t*>(out) = rows; }
+}
+
+void guess_experts(const float* logits, const float* bias, int rows, int experts, int m,
+                   std::int32_t* out, cudaStream_t stream) {
+    if (rows <= 0 || rows > 8 || m <= 0 || m > 32 || experts <= 0 || experts > kRouteThreads) {
+        throw std::invalid_argument("inkling2 guess_experts: at most 8 rows, 32 of 256 experts");
+    }
+    guess_experts_kernel<<<1, kRouteThreads, 0, stream>>>(logits, bias, rows, experts, m, out);
+    check_launch("guess_experts");
+}
+
 } // namespace ninfer::models::inkling2::kernels

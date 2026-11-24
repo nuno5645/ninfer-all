@@ -217,6 +217,15 @@ struct ExpertProbeRecord {
     std::int64_t seen = 0, issued = 0, cpu_done = 0, copies_done = 0, prepared = 0;
 };
 
+// hp-tune (N11'' measurement, NINFER_INK_GUESS_STATS): how well a visit's router applied to the
+// visit before's MoE input foresees the narrow calls' experts, the guesses m = 8 ([0]) and 12 ([1])
+// best experts of each row. misses_in: missing experts the guess held; open: guessed experts not
+// resident when the call was split, open_routed: of those, the ones the call routed.
+struct ExpertGuessStats {
+    std::uint64_t calls = 0, routes = 0, misses = 0;
+    std::uint64_t routes_in[2]{}, misses_in[2]{}, open[2]{}, open_routed[2]{};
+};
+
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
@@ -327,6 +336,13 @@ public:
     // request is in flight (after the compute stream's last call).
     void probe(bool on);
     std::size_t probe_records(std::span<ExpertProbeRecord> out) const;
+    // hp-tune (N11''): before the first request, a guess area in mapped host memory: per layer,
+    // 1 + rows * width words at guess_slot(layer) (device address), word 0 the rows a guess holds
+    // (written last; the service thread zeroes it once read), then each row's `width` experts,
+    // best first. A narrow call whose layer holds a guess counts it (guess_stats).
+    void enable_guess(std::uint32_t rows, std::uint32_t width);
+    [[nodiscard]] std::int32_t* guess_slot(std::size_t layer) const;
+    [[nodiscard]] ExpertGuessStats guess_stats() const;
 
 private:
     struct Impl;
