@@ -67,8 +67,11 @@ public:
     // coldest held experts of its pool as the last pass ended (the first 32 still held), the first
     // that `busy` (a flag per expert of `layer`, the call's routes) does not mark and whose count
     // the candidate's, with these pairs, reaches plus min_gain.
+    // hp-tune (N11''): `busy` marks the experts of `busy_layer` (-1: `layer`), and no expert of
+    // `avoid` (-1: none) qualifies.
     [[nodiscard]] Victim admission_victim(std::size_t layer, std::int32_t expert, float pairs,
-                                          std::span<const unsigned char> busy);
+                                          std::span<const unsigned char> busy,
+                                          std::int64_t busy_layer = -1, std::int64_t avoid = -1);
 
     struct Swap {
         std::uint32_t layer = 0;

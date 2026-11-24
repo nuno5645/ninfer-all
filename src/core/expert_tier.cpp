@@ -123,7 +123,9 @@ void ExpertTier::order_cold(std::uint32_t pool, std::size_t at) {
 
 ExpertTier::Victim ExpertTier::admission_victim(std::size_t layer, std::int32_t expert,
                                                 float pairs,
-                                                std::span<const unsigned char> busy) {
+                                                std::span<const unsigned char> busy,
+                                                std::int64_t busy_layer, std::int64_t avoid) {
+    const std::size_t marked = busy_layer < 0 ? layer : std::size_t(busy_layer);
     const float candidate = entries_[index(layer, expert)].count + pairs;
     const std::uint32_t pool = pools_[layer];
     const auto& list         = cold_[pool];
@@ -148,7 +150,8 @@ ExpertTier::Victim ExpertTier::admission_victim(std::size_t layer, std::int32_t 
             continue;
         }
         ++held;
-        if (l == layer && std::size_t(e) < busy.size() && busy[std::size_t(e)] != 0) { continue; }
+        if (avoid >= 0 && l == std::uint32_t(avoid)) { continue; }
+        if (l == marked && std::size_t(e) < busy.size() && busy[std::size_t(e)] != 0) { continue; }
         if (candidate >= victim.count + options_.min_gain) { return {l, e}; }
     }
     return {};

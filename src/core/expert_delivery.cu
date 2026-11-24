@@ -372,6 +372,9 @@ struct ExpertDelivery::Impl {
         std::int32_t layer = -1, expert = -1;
         std::uint64_t used = 0;
         std::vector<std::uint64_t> written;
+        // hp-tune (N11''): a read-ahead copy of (layer, expert) is in flight into it; no table
+        // entry points at it yet.
+        bool ahead = false;
     };
 
     // The cache slots of the layers whose experts' blobs need the same room (each blob's largest
@@ -438,6 +441,295 @@ struct ExpertDelivery::Impl {
     std::uint32_t guess_rows  = 0, guess_width = 0;
     ExpertGuessStats guess_counts;
     std::vector<unsigned char> guess_seen;
+    bool guess_score = true;
+
+    // hp-tune (N11'', NINFER_INK_PREFETCH): read-ahead copies (on ahead_stream) of a guessed
+    // layer's experts into a cache slot (pending) or a lent slot (`ahead`), each with its event;
+    // judged once the guessed layer's next narrow call has been served. ahead_seen: the layers
+    // whose current guess was read; ahead_armed: a narrow call is ready and its next visit's guess
+    // not read yet. Counts under `mutex`.
+    struct Ahead {
+        std::size_t layer   = 0;
+        std::int32_t expert = -1, slot = -1;
+        bool lent = false, judged = false;
+        cudaEvent_t landed = nullptr;
+    };
+    std::uint32_t ahead_max = 0, ahead_top = 0;
+    cudaStream_t ahead_stream = nullptr;
+    std::vector<Ahead> ahead;
+    std::vector<unsigned char> ahead_seen, ahead_pick;
+    bool ahead_armed = false;
+    std::chrono::steady_clock::time_point ahead_until{};
+    ExpertAheadStats ahead_counts;
+
+    void ahead_add(const ExpertAheadStats& d) {
+        std::lock_guard lock(mutex);
+        auto& c = ahead_counts;
+        c.issued += d.issued;
+        c.used += d.used;
+        c.waited += d.waited;
+        c.wasted += d.wasted;
+        c.no_room += d.no_room;
+        c.to_lent += d.to_lent;
+        c.narrow += d.narrow;
+        c.serve_ns += d.serve_ns;
+        c.wait_ns += d.wait_ns;
+    }
+
+    // A read-ahead copy has landed (or the copies stream waits for it): its table entries move to
+    // its slot, unless the slot holds something else by now.
+    void ahead_finish(const Ahead& r) {
+        auto& layer = layers[r.layer];
+        if (!r.lent) {
+            auto& slot = slots[std::size_t(r.slot)];
+            if (slot.layer == std::int32_t(r.layer) && slot.expert == r.expert && slot.pending) {
+                slot.pending = false;
+                point_slot(r.layer, r.expert, r.slot);
+                tier->set(r.layer, r.expert, ExpertTier::State::Held);
+            }
+            return;
+        }
+        auto& slot = lent_slots[std::size_t(r.slot)];
+        if (!slot.ahead || slot.layer != std::int32_t(r.layer) || slot.expert != r.expert) { return; }
+        slot.ahead = false;
+        if (layer.slot_of[std::size_t(r.expert)] >= 0 || layer.lent_of[std::size_t(r.expert)] >= 0) {
+            // A round gave it a cache slot meanwhile: the lent slot is free again.
+            slot.layer = slot.expert = -1;
+            return;
+        }
+        point_lent(r.layer, r.expert, r.slot);
+    }
+
+    // Every read-ahead copy has landed (the stream is waited for): every entry moves.
+    void ahead_flush(ExpertAheadStats& d) {
+        if (ahead.empty()) { return; }
+        CUDA_CHECK(ninfer::wait_for_stream(ahead_stream));
+        for (const auto& r : ahead) {
+            if (!r.judged) { ++d.wasted; }
+            ahead_finish(r);
+            spare_events.push_back(r.landed);
+        }
+        ahead.clear();
+    }
+
+    // A served call of layer li, after land(): read-ahead copies that landed move their entries;
+    // one still in flight whose expert this call misses orders the call's copies (and so its
+    // tables and its ready signal) after it. The guessed layer's call judges its copies.
+    void ahead_settle(std::size_t li, const std::uint32_t* needed, bool wide, ExpertAheadStats& d) {
+        if (wide) {
+            ahead_flush(d);
+            return;
+        }
+        for (auto it = ahead.begin(); it != ahead.end();) {
+            auto& r = *it;
+            const bool here = r.layer == li;
+            const bool routed = here && call_routed[std::size_t(r.expert)] != 0;
+            if (here && !r.judged) {
+                r.judged = true;
+                ++(routed ? d.used : d.wasted);
+            }
+            const cudaError_t status = cudaEventQuery(r.landed);
+            if (status == cudaErrorNotReady) {
+                if (!(routed && (needed[r.expert] & kMiss))) {
+                    ++it;
+                    continue;
+                }
+                CUDA_CHECK(cudaStreamWaitEvent(copies, r.landed, 0));
+                ++d.waited;
+            } else {
+                CUDA_CHECK(status);
+            }
+            ahead_finish(r);
+            spare_events.push_back(r.landed);
+            it = ahead.erase(it);
+        }
+    }
+
+    // A miss takes lent slot l while a read-ahead copy into it is in flight: the call's copies
+    // follow that copy, and its expert is not read ahead after all.
+    void ahead_cancel_lent(std::int32_t l) {
+        ExpertAheadStats d;
+        for (auto it = ahead.begin(); it != ahead.end(); ++it) {
+            if (!it->lent || it->slot != l) { continue; }
+            CUDA_CHECK(cudaStreamWaitEvent(copies, it->landed, 0));
+            spare_events.push_back(it->landed);
+            if (!it->judged) { ++d.wasted; }
+            ahead.erase(it);
+            break;
+        }
+        lent_slots[std::size_t(l)].ahead = false;
+        ahead_add(d);
+    }
+
+    // The lent slot a read-ahead copy for layer li takes: as next_lent() orders them, never one
+    // in flight, one of layer li (its call may read it) or one the ready call routes.
+    [[nodiscard]] std::int32_t ahead_lent(std::size_t li) const {
+        std::int32_t best = -1;
+        std::tuple<int, float, std::uint64_t> best_key{};
+        for (std::size_t k = 0; k < bank_lent.size(); ++k) {
+            if (!bank_lent[k]) { continue; }
+            for (std::uint32_t i = 0; i < per_bank; ++i) {
+                const auto l     = std::int32_t(k * per_bank + i);
+                const auto& slot = lent_slots[std::size_t(l)];
+                if (slot.ahead || slot.layer == std::int32_t(li)) { continue; }
+                if (slot.layer >= 0 && slot.layer == std::int32_t(call_layer) &&
+                    call_routed[std::size_t(slot.expert)]) {
+                    continue;
+                }
+                const auto key =
+                    slot.layer < 0
+                        ? std::tuple{0, 0.0F, std::uint64_t(0)}
+                        : std::tuple{options.loop_belady &&
+                                             tier->guarded(std::size_t(slot.layer), slot.expert)
+                                         ? 2 : 1,
+                                     tier->count(std::size_t(slot.layer), slot.expert),
+                                     slot.used};
+                if (best < 0 || key < best_key) {
+                    best     = l;
+                    best_key = key;
+                }
+            }
+        }
+        return best;
+    }
+
+    // One guessed expert's read-ahead copy into a free or tier-admitted cache slot, else a lent
+    // slot. The victim is never of layer li nor routed by the ready call: until the next call's
+    // tables are uploaded only those two layers' entries are read. false: no slot.
+    bool ahead_place(std::size_t li, std::int32_t e, ExpertDeliveryStats& delta,
+                     ExpertAheadStats& d) {
+        const auto& expert = layers[li].source.experts[std::size_t(e)];
+        std::int32_t s = -1;
+        auto& free = pool_of(li).free;
+        if (!free.empty()) {
+            s = free.back();
+            free.pop_back();
+        } else {
+            const auto victim = tier->admission_victim(li, e, 1.0F, call_routed,
+                                                       std::int64_t(call_layer), std::int64_t(li));
+            if (victim.expert >= 0) {
+                const auto v = layers[victim.layer].slot_of[std::size_t(victim.expert)];
+                if (v >= 0 && !slots[std::size_t(v)].pending) {
+                    evict(v, delta);
+                    s = v;
+                }
+            }
+        }
+        Ahead r;
+        r.layer  = li;
+        r.expert = e;
+        if (s >= 0) {
+            occupy(s, li, e, true);
+            for (std::size_t b = 0; b < expert.size(); ++b) {
+                const auto& blob  = expert[b];
+                std::byte* target = slot_blob(s, b);
+                CUDA_CHECK(cudaMemcpyAsync(target, blob.pinned, blob.bytes, cudaMemcpyHostToDevice,
+                                           ahead_stream));
+                auto& written = slots[std::size_t(s)].written[b];
+                if (written > blob.bytes) {
+                    CUDA_CHECK(cudaMemsetAsync(target + blob.bytes, 0, written - blob.bytes,
+                                               ahead_stream));
+                }
+                written = blob.bytes;
+                delta.copied_bytes += blob.bytes;
+            }
+            ++delta.admissions;
+            r.slot = s;
+        } else {
+            const std::int32_t l = any_lent() ? ahead_lent(li) : -1;
+            if (l < 0) { return false; }
+            auto& slot = lent_slots[std::size_t(l)];
+            if (slot.layer >= 0) {
+                point_nowhere(std::size_t(slot.layer), slot.expert);
+                ++delta.lent_evictions;
+            }
+            std::byte* base = lent_base(l);
+            for (std::size_t b = 0; b < expert.size(); ++b) {
+                const auto& blob = expert[b];
+                CUDA_CHECK(cudaMemcpyAsync(base + slot_offset[b], blob.pinned, blob.bytes,
+                                           cudaMemcpyHostToDevice, ahead_stream));
+                auto& written = slot.written[b];
+                if (written > blob.bytes) {
+                    CUDA_CHECK(cudaMemsetAsync(base + slot_offset[b] + blob.bytes, 0,
+                                               written - blob.bytes, ahead_stream));
+                }
+                written = blob.bytes;
+                delta.copied_bytes += blob.bytes;
+            }
+            slot.layer  = std::int32_t(li);
+            slot.expert = e;
+            slot.ahead  = true;
+            slot.used   = stamp;
+            ++delta.lent_admissions;
+            ++d.to_lent;
+            r.slot = l;
+            r.lent = true;
+        }
+        r.landed = take_event();
+        CUDA_CHECK(cudaEventRecord(r.landed, ahead_stream));
+        ahead.push_back(r);
+        ++d.issued;
+        return true;
+    }
+
+    // Once a narrow call is ready: the guess its next visit's layer holds, if one has arrived, and
+    // up to ahead_max of its guessed experts that no slot, lent slot or bank holds, best first.
+    void ahead_issue() {
+        const std::size_t stride = 1 + std::size_t(guess_rows) * guess_width;
+        const auto* area = static_cast<const volatile std::int32_t*>(guess_host->data());
+        std::size_t li     = layers.size();
+        std::int32_t rows  = 0;
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            if (ahead_seen[l]) { continue; }
+            const std::int32_t n = area[l * stride];
+            if (n > 0 && std::uint32_t(n) <= guess_rows) {
+                li   = l;
+                rows = n;
+                break;
+            }
+        }
+        if (li == layers.size()) { return; }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        ahead_armed  = false;
+        ahead_seen[li] = 1;
+        if (li == call_layer) { return; } // its entries may be read now: nothing to place safely
+        auto& layer       = layers[li];
+        const int experts = int(layer.source.experts.size());
+        const int held    = bank_holding(li);
+        ahead_pick.assign(std::size_t(experts), 0);
+        ExpertDeliveryStats delta;
+        ExpertAheadStats d;
+        std::uint32_t placed = 0;
+        const std::uint32_t top = std::min(ahead_top, guess_width);
+        for (std::uint32_t j = 0; j < top && placed < ahead_max; ++j) {
+            for (std::int32_t r = 0; r < rows && placed < ahead_max; ++r) {
+                const std::int32_t e = area[li * stride + 1 + std::size_t(r) * guess_width + j];
+                if (e < 0 || e >= experts || ahead_pick[std::size_t(e)]) { continue; }
+                ahead_pick[std::size_t(e)] = 1;
+                if (layer.slot_of[std::size_t(e)] >= 0 || layer.lent_of[std::size_t(e)] >= 0 ||
+                    layer.bank_of[std::size_t(e)] >= 0 ||
+                    (held >= 0 && bank_state[std::size_t(held)].valid[std::size_t(e)])) {
+                    continue;
+                }
+                const bool pending = std::any_of(ahead.begin(), ahead.end(), [&](const Ahead& a) {
+                    return a.layer == li && a.expert == e;
+                });
+                if (pending) { continue; }
+                const auto& blobs = layer.source.experts[std::size_t(e)];
+                if (!std::all_of(blobs.begin(), blobs.end(),
+                                 [](const ExpertBlob& b) { return b.pinned != nullptr; })) {
+                    continue;
+                }
+                if (ahead_place(li, e, delta, d)) {
+                    ++placed;
+                } else {
+                    ++d.no_room;
+                }
+            }
+        }
+        add(delta);
+        ahead_add(d);
+    }
 
     // A narrow call of layer li, before its misses are placed: the guess its layer holds against
     // the call's routes (needed) and the residency its split saw.
@@ -1031,6 +1323,12 @@ struct ExpertDelivery::Impl {
         if (service.joinable()) { service.join(); }
         ninfer::wait_for_stream(copies);
         ninfer::wait_for_stream(rounds);
+        if (ahead_stream) {
+            ninfer::wait_for_stream(ahead_stream);
+            for (const auto& r : ahead) { spare_events.push_back(r.landed); }
+            ahead.clear();
+            cudaStreamDestroy(ahead_stream);
+        }
         for (auto event : copied) { cudaEventDestroy(event); }
         for (auto& layer : layers) {
             for (auto event : layer.uploaded) { if (event) { cudaEventDestroy(event); } }
@@ -1293,8 +1591,10 @@ struct ExpertDelivery::Impl {
                 if (slot.layer == std::int32_t(li) && call_routed[std::size_t(slot.expert)]) { continue; }
                 if (std::find(taken.begin(), taken.end(), l) != taken.end()) { continue; }
                 // hp-tune (N12): a guarded expert (due again this token) only after the others.
+                // hp-tune (N11''): a slot a read-ahead copy fills, last of all.
                 const auto key =
-                    slot.layer < 0
+                    slot.ahead ? std::tuple{3, 0.0F, std::uint64_t(0)}
+                    : slot.layer < 0
                         ? std::tuple{0, 0.0F, std::uint64_t(0)}
                         : std::tuple{options.loop_belady &&
                                              tier->guarded(std::size_t(slot.layer), slot.expert)
@@ -1312,6 +1612,7 @@ struct ExpertDelivery::Impl {
 
     // Copies a narrow call's missing expert e of layer li into lent slot l.
     void admit_lent(std::int32_t l, std::size_t li, std::int32_t e, ExpertDeliveryStats& delta) {
+        if (lent_slots[std::size_t(l)].ahead) { ahead_cancel_lent(l); } // hp-tune (N11'')
         const auto& slot = lent_slots[std::size_t(l)];
         if (slot.layer >= 0 && options.loop_belady &&
             tier->guarded(std::size_t(slot.layer), slot.expert)) {
@@ -1885,6 +2186,8 @@ struct ExpertDelivery::Impl {
             const auto s = layer.slot_of[std::size_t(e)];
             if (s >= 0 && !slots[std::size_t(s)].pending) { continue; }
             if (held >= 0 && bank_state[std::size_t(held)].valid[std::size_t(e)]) { continue; }
+            // hp-tune (N11''): a read-ahead copy into a lent slot landed after the split.
+            if (ahead_max && layer.lent_of[std::size_t(e)] >= 0) { continue; }
             order.emplace_back(needed[e] & kCountMask, e);
         }
         std::stable_sort(order.begin(), order.end(),
@@ -2040,7 +2343,12 @@ struct ExpertDelivery::Impl {
             probe_now.wide     = wide;
             probe_now.seen     = probe_clock(started);
         }
-        if (guess_host && !wide) { count_guess(li, needed); } // hp-tune (N11'')
+        if (guess_host) {
+            // hp-tune (N11''): the guess of this layer is scored and cleared.
+            if (guess_score && !wide) { count_guess(li, needed); }
+            static_cast<volatile std::int32_t*>(guess_host->data())[li * (1 + std::size_t(guess_rows) * guess_width)] = 0;
+            if (!ahead_seen.empty()) { ahead_seen[li] = 0; }
+        }
         if (skip_on && !wide) {
             // hp-tune (miss-skip): the dropped experts were misses and routes before the split.
             if (li == 0 && ++skip_passes % 256 == 0) {
@@ -2058,6 +2366,8 @@ struct ExpertDelivery::Impl {
             for (int e = 0; e < experts; ++e) { skip_missing += (needed[e] & kMiss) ? 1 : 0; }
         }
         land(!wide);
+        ExpertAheadStats ahead_delta; // hp-tune (N11'')
+        if (ahead_max) { ahead_settle(li, needed, wide, ahead_delta); }
         ++stamp;
         for (int e = 0; e < experts; ++e) {
             const auto l = layer.lent_of[std::size_t(e)];
@@ -2186,7 +2496,17 @@ struct ExpertDelivery::Impl {
             ranges_dirty = false;
         }
         upload_tables();
+        const auto waiting = std::chrono::steady_clock::now();
         CUDA_CHECK(ninfer::wait_for_stream(copies));
+        if (ahead_max && !wide) {
+            const auto now = std::chrono::steady_clock::now();
+            ahead_delta.narrow   = 1;
+            ahead_delta.wait_ns  = std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - waiting).count());
+            ahead_delta.serve_ns = std::uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - started).count());
+        }
+        if (ahead_max) { ahead_add(ahead_delta); }
         if (probe_on) {
             probe_now.copies_done = probe_clock();
             probe_now.copied += std::uint32_t(to_bank.size());
@@ -2306,6 +2626,18 @@ struct ExpertDelivery::Impl {
                 spinning = false;
             }
             if (!request) {
+                if (ahead_armed) {
+                    // hp-tune (N11''): the next visit's guess may arrive after the ready call;
+                    // the last visit of a call has none, so the wait for it ends.
+                    if (now >= ahead_until) {
+                        ahead_armed = false;
+                    } else {
+                        try { check(); ahead_issue(); }
+                        catch (...) { ahead_armed = false; fail(nullptr); }
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
                 if (now < active_until) { std::this_thread::yield(); }
                 else { std::this_thread::sleep_for(std::chrono::microseconds(20)); }
                 continue;
@@ -2327,6 +2659,13 @@ struct ExpertDelivery::Impl {
             }
             handshake->prepared(request->sequence);
             served = request->sequence;
+            if (served_ok && ahead_max) {
+                // hp-tune (N11''): the next visit's read-ahead before the round's copies.
+                ahead_armed = !call_wide;
+                ahead_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+                try { if (ahead_armed) { ahead_issue(); } }
+                catch (...) { ahead_armed = false; fail(nullptr); }
+            }
             if (served_ok) {
                 try { post(); }
                 catch (...) { fail(nullptr); }
@@ -2347,6 +2686,7 @@ struct ExpertDelivery::Impl {
         }
         CUDA_CHECK(ninfer::wait_for_stream(copies));
         CUDA_CHECK(ninfer::wait_for_stream(rounds));
+        if (ahead_stream) { CUDA_CHECK(ninfer::wait_for_stream(ahead_stream)); }
     }
 
     // An elastic cache, quiesced and locked: gives back at least `bytes` of whole granules, or
@@ -2363,6 +2703,9 @@ struct ExpertDelivery::Impl {
         for (const auto& pool : pools) { counts.push_back(pool.count); }
         const auto keep = trim_pools(before - std::min(before, drop), counts);
         ExpertDeliveryStats delta;
+        ExpertAheadStats ahead_delta; // hp-tune (N11''): every read-ahead entry moves first
+        ahead_flush(ahead_delta);
+        ahead_counts.wasted += ahead_delta.wasted;
         land();
         for (const auto& d : queued) {
             if (slots[std::size_t(d.slot)].layer >= 0) { evict(d.slot, delta); }
@@ -2577,7 +2920,15 @@ void ExpertDelivery::invalidate() {
         std::fill(layer.lent_of.begin(), layer.lent_of.end(), -1);
         std::fill(layer.bank_of.begin(), layer.bank_of.end(), std::int8_t(-1));
     }
-    for (auto& slot : p.lent_slots) { slot.layer = slot.expert = -1; }
+    for (auto& slot : p.lent_slots) {
+        slot.layer = slot.expert = -1;
+        slot.ahead = false;
+    }
+    // hp-tune (N11''): drained, so every read-ahead copy has landed; none is judged.
+    for (const auto& r : p.ahead) { p.spare_events.push_back(r.landed); }
+    p.ahead.clear();
+    p.ahead_armed = false;
+    std::fill(p.ahead_seen.begin(), p.ahead_seen.end(), 0);
     std::fill(p.bank_lent.begin(), p.bank_lent.end(), 0);
     std::memset(p.host_ranges->data(), 0, p.host_ranges->size());
     p.lent_ranges.fill();
@@ -2746,8 +3097,9 @@ std::size_t ExpertDelivery::probe_records(std::span<ExpertProbeRecord> out) cons
     }
     return std::size_t(k);
 }
-void ExpertDelivery::enable_guess(std::uint32_t rows, std::uint32_t width) {
+void ExpertDelivery::enable_guess(std::uint32_t rows, std::uint32_t width, bool score) {
     auto& p = *impl_;
+    p.guess_score = score;
     if (rows == 0 || width == 0) { throw std::invalid_argument("expert delivery: an empty guess"); }
     const std::size_t words = p.layers.size() * (1 + std::size_t(rows) * width);
     p.guess_host            = std::make_unique<PinnedHostBuffer>(words * 4);
@@ -2765,6 +3117,24 @@ std::int32_t* ExpertDelivery::guess_slot(std::size_t layer) const {
 ExpertGuessStats ExpertDelivery::guess_stats() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->guess_counts;
+}
+void ExpertDelivery::enable_ahead(std::uint32_t per_visit, std::uint32_t top) {
+    auto& p = *impl_;
+    if (!p.guess_host) { throw std::logic_error("expert delivery: read-ahead needs a guess area"); }
+    if (per_visit == 0 || top == 0) { throw std::invalid_argument("expert delivery: an empty read-ahead"); }
+    DeviceBinding bind(p.rank.device);
+    if (!p.ahead_stream) {
+        int least = 0, greatest = 0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&p.ahead_stream, cudaStreamNonBlocking, least));
+    }
+    p.ahead_seen.assign(p.layers.size(), 0);
+    p.ahead_top = std::min(top, p.guess_width);
+    p.ahead_max = per_visit;
+}
+ExpertAheadStats ExpertDelivery::ahead_stats() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->ahead_counts;
 }
 std::string ExpertDelivery::cpu_description() const {
     if (!impl_->pool) { return {}; }

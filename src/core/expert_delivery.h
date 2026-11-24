@@ -226,6 +226,16 @@ struct ExpertGuessStats {
     std::uint64_t routes_in[2]{}, misses_in[2]{}, open[2]{}, open_routed[2]{};
 };
 
+// hp-tune (N11'', NINFER_INK_PREFETCH): the read-ahead of a narrow call's guessed misses. issued:
+// copies read ahead; used: of those, experts the visit they were guessed for routed (waited: still
+// in flight then, the call's service waited for them); wasted: not routed there; no_room: guessed
+// misses with no slot to take; narrow calls served, with the service's host time and its wait
+// for the call's copies (nanoseconds).
+struct ExpertAheadStats {
+    std::uint64_t issued = 0, used = 0, waited = 0, wasted = 0, no_room = 0, to_lent = 0;
+    std::uint64_t narrow = 0, serve_ns = 0, wait_ns = 0;
+};
+
 // One Program, rank and serial compute stream. Sources outlive this object. All device addresses
 // stay fixed until destruction. The caller drains graph users before destroying their graphs.
 //
@@ -340,9 +350,18 @@ public:
     // 1 + rows * width words at guess_slot(layer) (device address), word 0 the rows a guess holds
     // (written last; the service thread zeroes it once read), then each row's `width` experts,
     // best first. A narrow call whose layer holds a guess counts it (guess_stats).
-    void enable_guess(std::uint32_t rows, std::uint32_t width);
+    // `score`: count each guess (guess_stats); without it a narrow call only clears its layer's.
+    void enable_guess(std::uint32_t rows, std::uint32_t width, bool score = true);
     [[nodiscard]] std::int32_t* guess_slot(std::size_t layer) const;
     [[nodiscard]] ExpertGuessStats guess_stats() const;
+    // hp-tune (N11''): after enable_guess, before the first request. Once a narrow call is ready,
+    // the service thread reads ahead, on a stream of its own, up to `per_visit` experts of the guess
+    // that holds (each row's `top` best, best first) and are not resident, into a cache slot the
+    // tier admits them to, else a lent slot: never in place of an expert of the guessed layer nor
+    // one the ready call routes. Their table entries move at a later call once their copy landed;
+    // a call that routes one still in flight orders its own copies after it. Pinned experts only.
+    void enable_ahead(std::uint32_t per_visit, std::uint32_t top);
+    [[nodiscard]] ExpertAheadStats ahead_stats() const;
 
 private:
     struct Impl;

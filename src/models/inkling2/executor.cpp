@@ -349,6 +349,11 @@ struct Executor::Impl {
     DeviceBuffer guess_logits;
     std::uint64_t guess_tokens = 0, guess_next = 256;
     ExpertGuessStats guess_last{};
+    // hp-tune (N11'', NINFER_INK_PREFETCH=M): the delivery reads ahead up to M guessed experts a
+    // visit (each row's NINFER_INK_PREFETCH_TOP best, default 8); counts every 256 tokens.
+    std::uint32_t prefetch = 0;
+    std::uint64_t prefetch_tokens = 0, prefetch_next = 256;
+    ExpertAheadStats prefetch_last{};
     std::unique_ptr<dspine::Runtime> spine;
     std::unique_ptr<Spark> spark;
     // The vision tower and its buffers: an image's patches, a span's rows.
@@ -662,20 +667,37 @@ struct Executor::Impl {
     }
 
     void plan_guess() {
-        const char* e = std::getenv("NINFER_INK_GUESS_STATS");
-        if (e == nullptr || std::atoi(e) != 1) { return; }
+        const char* e  = std::getenv("NINFER_INK_GUESS_STATS");
+        const bool stats = e != nullptr && std::atoi(e) == 1;
+        const char* pf = std::getenv("NINFER_INK_PREFETCH");
+        const int ahead = pf != nullptr ? std::clamp(std::atoi(pf), 0, 16) : 0;
+        if (!stats && ahead == 0) { return; }
         if (!delivery || model.expert_parallel() || bf16_rows) {
             std::fprintf(stderr, "hp-guess: off (host experts with q8_1 decode calls only)\n");
+            if (ahead) { std::fprintf(stderr, "hp-tune: prefetch off (no guess)\n"); }
             return;
         }
-        guess_stats = true;
-        delivery->enable_guess(std::uint32_t(gguf::kMaxVectorColumns), kGuessWidth);
+        guess_stats = stats;
+        delivery->enable_guess(std::uint32_t(gguf::kMaxVectorColumns), kGuessWidth, stats);
+        if (ahead > 0) {
+            const char* t  = std::getenv("NINFER_INK_PREFETCH_TOP");
+            const int top  = t != nullptr && std::atoi(t) > 0 ? std::min(std::atoi(t), kGuessWidth) : 8;
+            prefetch       = std::uint32_t(ahead);
+            delivery->enable_ahead(prefetch, std::uint32_t(top));
+            std::fprintf(stderr,
+                         "hp-tune: prefetch %u (each decode visit reads ahead up to %u of the next "
+                         "visit's guessed experts, each row's %d best; counts every 256 tokens)\n",
+                         prefetch, prefetch, top);
+        }
         CUDA_CHECK(cudaStreamCreateWithFlags(&guess_stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&guess_fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&guess_done, cudaEventDisableTiming));
         guess_logits = DeviceBuffer(std::size_t(gguf::kMaxVectorColumns) * config.num_experts * 4);
-        std::fprintf(stderr, "hp-guess: on: each decode visit's router guesses the next visit's "
-                             "experts (m = 8 and %d), scored every 256 tokens\n", kGuessWidth);
+        if (stats) {
+            std::fprintf(stderr, "hp-guess: on: each decode visit's router guesses the next "
+                                 "visit's experts (m = 8 and %d), scored every 256 tokens\n",
+                         kGuessWidth);
+        }
     }
 
     // hp-tune (E1): the device rows of a call's tokens beside a token table in host memory.
@@ -2787,7 +2809,10 @@ struct Executor::Impl {
         ra.cur     = s.buffers[s.cur];
         ra.hidden  = hidden;
         ra.mix.split = c.split;
-        if (c.guess && v + 1 < visits.size()) { guess_ahead(c, v + 1); } // hp-tune (N11'')
+        // hp-tune (N11''): a next visit to another layer (its call clears its layer's guess).
+        if (c.guess && v + 1 < visits.size() && visits[v + 1].layer != visits[v].layer) {
+            guess_ahead(c, v + 1);
+        }
         experts(lp, c, ra);
         probe_mark(c, v, 7);
         if (c.guess_open) {
@@ -2826,8 +2851,38 @@ struct Executor::Impl {
         c.guess_open = true;
     }
 
+    // hp-tune (N11''): every 256 tokens, the read-ahead's counts since the last line.
+    void prefetch_count(std::uint64_t tokens) {
+        if (prefetch == 0) { return; }
+        prefetch_tokens += tokens;
+        if (prefetch_tokens < prefetch_next) { return; }
+        prefetch_next = prefetch_tokens + 256;
+        const ExpertAheadStats now = delivery->ahead_stats();
+        const auto& l = prefetch_last;
+        const std::uint64_t issued = now.issued - l.issued, used = now.used - l.used,
+                            waited = now.waited - l.waited, wasted = now.wasted - l.wasted,
+                            no_room = now.no_room - l.no_room, to_lent = now.to_lent - l.to_lent,
+                            narrow = now.narrow - l.narrow, serve = now.serve_ns - l.serve_ns,
+                            wait = now.wait_ns - l.wait_ns;
+        prefetch_last = now;
+        const double visits_n = double(std::max<std::uint64_t>(narrow, 1));
+        std::fprintf(stderr,
+                     "hp-prefetch: %llu tok, %llu visitas | antecipadas %llu (%.2f/visita, %llu "
+                     "em slots emprestados), usadas %llu (%.1f%%, %llu ainda em voo), "
+                     "desperdicadas %llu, sem lugar %llu | servico %.3f ms/visita, espera pelas "
+                     "copias %.3f ms/visita\n",
+                     (unsigned long long)prefetch_tokens, (unsigned long long)narrow,
+                     (unsigned long long)issued, double(issued) / visits_n,
+                     (unsigned long long)to_lent, (unsigned long long)used,
+                     100.0 * double(used) / double(std::max<std::uint64_t>(used + wasted, 1)),
+                     (unsigned long long)waited, (unsigned long long)wasted,
+                     (unsigned long long)no_room, double(serve) / visits_n / 1e6,
+                     double(wait) / visits_n / 1e6);
+    }
+
     // hp-tune (N11''): tokens decoded or committed; every 256 the guesses' scores since the last.
     void guess_count(std::uint64_t tokens) {
+        prefetch_count(tokens);
         if (!guess_stats) { return; }
         guess_tokens += tokens;
         if (guess_tokens < guess_next) { return; }
@@ -3541,7 +3596,7 @@ struct Executor::Impl {
             c.probe_capture = capturing == cudaStreamCaptureStatusActive;
             probe_record(c, 0);
         }
-        c.guess = guess_stats && c.q8; // hp-tune (N11'')
+        c.guess = (guess_stats || prefetch != 0) && c.q8; // hp-tune (N11'')
         run_with_taps(c, {}, 0, spine ? b : 0);
         if (c.q8) {
             head_logits_q8(c.ffn_q, b, b);
@@ -3833,6 +3888,11 @@ struct Executor::Impl {
             guess_last   = delivery->guess_stats();
             guess_tokens = 0;
             guess_next   = 256;
+        }
+        if (prefetch != 0) {
+            prefetch_last   = delivery->ahead_stats();
+            prefetch_tokens = 0;
+            prefetch_next   = 256;
         }
         if (delivery) {
             delivery->drain();
