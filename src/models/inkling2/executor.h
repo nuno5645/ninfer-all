@@ -85,6 +85,9 @@ struct ExecutorOptions {
     // rest of a prefill_chunk workspace on demand from the elastic expert cache, and the next
     // decode or verification gives it back. 0: one workspace for prefill_chunk (upstream).
     std::uint32_t workspace_chunk = 0;
+    // hp-tune (T1, short prompt tails): nonzero, the rows (at most 8) of forward_short()'s slices;
+    // warm_up() also captures their graphs. 0: forward_short() is not used.
+    std::uint32_t short_rows = 0;
 };
 
 struct ExecutorMemory {
@@ -153,6 +156,14 @@ public:
     // image rows in place of their tokens' embeddings.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ImageRows> images = {});
+    // hp-tune (T1): a short text prompt tail by the decode path: `tokens` at the sequence's next
+    // positions in slices of at most options().short_rows rows (the last slice the remainder), each
+    // a verification's pass (the expert cache with its misses and CPU share, the decode workspace,
+    // no layer-bank sweep, no wide workspace) that keeps every row. Leaves the last token's logits
+    // in logits() column 0 when `logit_rows` is 1 (0 or 1). The sequence's state after it is the
+    // one forward() leaves, up to the decode path's order of sums.
+    void forward_short(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                       std::uint32_t logit_rows);
     // Branches of a prompt in one pass, each continuing the sequence from its position: branch b
     // runs `lengths[b]` of `tokens` (in branch order) at the positions after the sequence's,
     // seeing the sequence's keys and its own. Leaves the logits of each branch's last token in

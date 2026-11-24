@@ -3083,6 +3083,68 @@ struct Executor::Impl {
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
     }
 
+    // ---- hp-tune (T1): short prompt tails by the decode path --------------------------------------
+
+    // A verification's pass over b <= 8 rows of one sequence that keeps every row (no miss-skip:
+    // that is a decode step's only), with the last row's logits in column 0 when `logits`.
+    void short_body(int b, bool logits) {
+        workspace->reset();
+        auto scope = workspace->scope();
+        Call c;
+        c.t              = b;
+        c.row_group      = std::min(b, kernels::kMaxRowGroup);
+        c.q8             = !bf16_rows;
+        c.keep           = true;
+        c.decode         = false;
+        c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
+        c.rows.sequences = static_cast<const std::int32_t*>(d_sequences.p);
+        c.rows.tokens    = b;
+        c.plane          = std::int64_t(b) * hidden;
+        c.spark_rows     = b;
+        run_with_taps(c, {}, 0, spine ? b : 0);
+        if (!logits) { return; }
+        if (c.q8) {
+            head_logits_q8(c.ffn_q, b, 1);
+        } else {
+            head_logits(c.ffn_bf16 + std::int64_t(b - 1) * hidden, 1, 0);
+        }
+    }
+
+    // Graph keys past the decode (1..8) and verification (17..24) ones.
+    static constexpr std::uint32_t kShortGraphs = 0x1000;
+
+    void forward_short(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                       std::uint32_t logit_rows) {
+        const int t = int(tokens.size());
+        const int w = std::clamp<int>(int(options.short_rows), 1, gguf::kMaxVectorColumns);
+        if (options.short_rows == 0 || sequence >= options.sequences || t <= 0 || logit_rows > 1) {
+            throw std::invalid_argument("inkling2 forward_short: invalid call");
+        }
+        if (positions[sequence] + std::uint32_t(t) > options.max_context) {
+            throw std::invalid_argument("inkling2 forward_short: context capacity exceeded");
+        }
+        narrow();
+        std::vector<std::int32_t> pos, seq;
+        for (int at = 0; at < t;) {
+            const int b           = std::min(w, t - at);
+            const bool last       = at + b == t;
+            const bool logits     = last && logit_rows == 1;
+            const std::uint32_t first = positions[sequence];
+            pos.resize(b);
+            seq.assign(b, std::int32_t(sequence));
+            for (int i = 0; i < b; ++i) { pos[i] = std::int32_t(first) + i; }
+            back(sequence, first + std::uint32_t(b));
+            stage(tokens.subspan(std::size_t(at), std::size_t(b)), pos, seq);
+            run_graph(kShortGraphs + 2 * std::uint32_t(b) + (logits ? 1U : 0U),
+                      [&] { short_body(b, logits); });
+            if (spine) { spine->commit(spine->lane(sequence), first, 0, std::uint32_t(b), stream); }
+            positions[sequence] = first + std::uint32_t(b);
+            at += b;
+        }
+        // As after a prompt chunk: no rewind before the prompt's end.
+        ring_floor[sequence] = positions[sequence];
+    }
+
     // ---- Speculative rounds ----------------------------------------------------------------------
 
     void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
@@ -3215,6 +3277,19 @@ struct Executor::Impl {
                 const std::uint32_t one = 1;
                 commit({&s, 1}, {&one, 1});
                 positions[0] = 0;
+            }
+        }
+        if (options.short_rows > 0) {
+            // hp-tune (T1): the full slices and every last slice with its logits.
+            const int w = std::clamp<int>(int(options.short_rows), 1, gguf::kMaxVectorColumns);
+            for (int b = 1; b <= w; ++b) {
+                const std::vector<std::int32_t> row(std::size_t(b), 2);
+                for (int pass = 0; pass < 2; ++pass) {
+                    forward_short(0, row, 1);
+                    if (b == w) { forward_short(0, row, 0); }
+                    positions[0]  = 0;
+                    ring_floor[0] = 0;
+                }
             }
         }
         CUDA_CHECK(ninfer::wait_for_stream(stream));
@@ -3498,6 +3573,11 @@ std::string Executor::expert_cpu_description() const {
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows, std::span<const ImageRows> images) {
     impl_->forward(sequence, tokens, logit_rows, {}, 0, images);
+}
+
+void Executor::forward_short(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                             std::uint32_t logit_rows) {
+    impl_->forward_short(sequence, tokens, logit_rows);
 }
 
 void Executor::forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,

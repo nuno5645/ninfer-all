@@ -69,6 +69,26 @@ double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
 }
 
+// hp-tune (T1): NINFER_INK_SHORT_TAIL=N (0, off, by default) runs a text prompt tail of at most N
+// tokens (what a multi-turn conversation adds over its cached context) by the decode path, in
+// slices of NINFER_INK_SHORT_ROWS rows (1..8, 8 by default): the expert cache with its misses and
+// CPU share instead of a layer-bank sweep, and no wide workspace.
+struct ShortTail {
+    std::uint32_t tokens = 0, rows = 0;
+};
+
+ShortTail short_tail_env() {
+    ShortTail out;
+    if (const char* e = std::getenv("NINFER_INK_SHORT_TAIL"); e != nullptr && std::atoi(e) > 0) {
+        out.tokens = std::uint32_t(std::atoi(e));
+        out.rows   = 8;
+        if (const char* r = std::getenv("NINFER_INK_SHORT_ROWS"); r != nullptr && std::atoi(r) > 0) {
+            out.rows = std::min<std::uint32_t>(std::uint32_t(std::atoi(r)), 8u);
+        }
+    }
+    return out;
+}
+
 bool request_error(const std::exception_ptr& error) {
     try {
         std::rethrow_exception(error);
@@ -301,6 +321,11 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         }
         std::fprintf(stderr, "hp-tune: elastic workspace requested, prompt chunks of %u\n",
                      unsigned(wide_chunk));
+    }
+    if (const ShortTail tail = short_tail_env(); tail.tokens > 0) {
+        executor.short_rows = tail.rows;
+        std::fprintf(stderr, "hp-tune: short tail %u (slices of %u rows by the decode path)\n",
+                     unsigned(tail.tokens), unsigned(tail.rows));
     }
     std::vector<std::uint32_t> chunks{2048u, 1024u, 512u};
     if (const char* e = std::getenv("NINFER_INK_CHUNK"); e != nullptr && std::atoi(e) >= 128) {
@@ -576,6 +601,9 @@ struct Inkling2Core::Request {
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
     // The prompt tokens and the prompt time the stats hold so far (count_prefill).
     std::uint32_t prefill_counted = 0;
+    // hp-tune (T1): the prompt tokens that ran by the decode path, and when the first did.
+    std::uint32_t short_tail_tokens = 0;
+    Clock::time_point short_tail_start;
     Clock::time_point prefill_counted_at;
     SpeculativeStats speculative; // an Engine with --lookup-ngram only
     // With --adaptive-mtp: how far its DSpark drafts survive, position by position.
@@ -679,6 +707,10 @@ struct Inkling2Core::Impl {
     static constexpr double kPrefillSecondsPerToken  = 2e-4;
     std::uint32_t decode_run                = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
+    // hp-tune (T1): the prompt tail NINFER_INK_SHORT_TAIL allows by the decode path (0: off), and
+    // the tokens that went that way since the start.
+    const std::uint32_t short_tail = short_tail_env().tokens;
+    std::uint64_t short_tail_total = 0;
 
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
     DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
@@ -1872,8 +1904,18 @@ struct Inkling2Core::Impl {
         if (lengths.empty()) {
             // A chunk before the prompt's end leaves no logits: its last block only writes its
             // keys and values.
-            executor.forward(r.slot, chunk, r.prefilled + n < prompt_n ? 0U : 1U,
-                             chunk_images(r, r.prefilled, r.prefilled + n));
+            const std::uint32_t logit_rows = r.prefilled + n < prompt_n ? 0U : 1U;
+            auto images = chunk_images(r, r.prefilled, r.prefilled + n);
+            // hp-tune (T1): a short text tail by the decode path.
+            if (short_tail > 0 && executor.options().short_rows > 0 && images.empty() &&
+                !r.branches && prompt_n - r.prefilled <= short_tail) {
+                if (r.short_tail_tokens == 0) { r.short_tail_start = Clock::now(); }
+                executor.forward_short(r.slot, chunk, logit_rows);
+                r.short_tail_tokens += n;
+                short_tail_total += n;
+            } else {
+                executor.forward(r.slot, chunk, logit_rows, images);
+            }
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
@@ -2119,6 +2161,14 @@ struct Inkling2Core::Impl {
         executor.check_experts();
         r.prefill_end = Clock::now();
         count_prefill(r, prompt_n - r.reused, r.prefill_end);
+        if (r.short_tail_tokens > 0) {
+            std::fprintf(stderr,
+                         "hp-tune: short tail: request %llu, %u of %u prompt tokens by the decode "
+                         "path (%u reused), %.1f ms; %llu in all\n",
+                         (unsigned long long)r.id, unsigned(r.short_tail_tokens), unsigned(prompt_n),
+                         unsigned(r.reused), 1e3 * seconds(r.short_tail_start, r.prefill_end),
+                         (unsigned long long)short_tail_total);
+        }
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);
