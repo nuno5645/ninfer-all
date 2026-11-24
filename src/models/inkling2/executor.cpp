@@ -2864,20 +2864,23 @@ struct Executor::Impl {
                             no_room = now.no_room - l.no_room, to_lent = now.to_lent - l.to_lent,
                             narrow = now.narrow - l.narrow, serve = now.serve_ns - l.serve_ns,
                             wait = now.wait_ns - l.wait_ns;
+        const std::uint64_t mismatch = now.mismatch - l.mismatch,
+                            ambiguous = now.ambiguous - l.ambiguous;
         prefetch_last = now;
         const double visits_n = double(std::max<std::uint64_t>(narrow, 1));
         std::fprintf(stderr,
                      "hp-prefetch: %llu tok, %llu visitas | antecipadas %llu (%.2f/visita, %llu "
                      "em slots emprestados), usadas %llu (%.1f%%, %llu ainda em voo), "
                      "desperdicadas %llu, sem lugar %llu | servico %.3f ms/visita, espera pelas "
-                     "copias %.3f ms/visita\n",
+                     "copias %.3f ms/visita | camada errada %llu, ambiguas %llu\n",
                      (unsigned long long)prefetch_tokens, (unsigned long long)narrow,
                      (unsigned long long)issued, double(issued) / visits_n,
                      (unsigned long long)to_lent, (unsigned long long)used,
                      100.0 * double(used) / double(std::max<std::uint64_t>(used + wasted, 1)),
                      (unsigned long long)waited, (unsigned long long)wasted,
                      (unsigned long long)no_room, double(serve) / visits_n / 1e6,
-                     double(wait) / visits_n / 1e6);
+                     double(wait) / visits_n / 1e6, (unsigned long long)mismatch,
+                     (unsigned long long)ambiguous);
     }
 
     // hp-tune (N11''): tokens decoded or committed; every 256 the guesses' scores since the last.
@@ -2986,6 +2989,12 @@ struct Executor::Impl {
                 skip.weights = weights;
                 skip.scale   = p.down_scale;
                 skip.top_k   = k;
+            }
+            if (c.guess_open && prefetch != 0) {
+                // hp-tune (N11''): the next visit's guess is in place before this visit's request
+                // is published, so the delivery reads it ahead for that request only.
+                CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
+                c.guess_open = false;
             }
             call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
                                    cpu ? std::span<const ExpertDelivery::Input>(inputs)

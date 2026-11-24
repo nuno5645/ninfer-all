@@ -445,9 +445,7 @@ struct ExpertDelivery::Impl {
 
     // hp-tune (N11'', NINFER_INK_PREFETCH): read-ahead copies (on ahead_stream) of a guessed
     // layer's experts into a cache slot (pending) or a lent slot (`ahead`), each with its event;
-    // judged once the guessed layer's next narrow call has been served. ahead_seen: the layers
-    // whose current guess was read; ahead_armed: a narrow call is ready and its next visit's guess
-    // not read yet. Counts under `mutex`.
+    // judged once the guessed layer's next narrow call has been served. Counts under `mutex`.
     struct Ahead {
         std::size_t layer   = 0;
         std::int32_t expert = -1, slot = -1;
@@ -457,9 +455,16 @@ struct ExpertDelivery::Impl {
     std::uint32_t ahead_max = 0, ahead_top = 0;
     cudaStream_t ahead_stream = nullptr;
     std::vector<Ahead> ahead;
-    std::vector<unsigned char> ahead_seen, ahead_pick;
-    bool ahead_armed = false;
-    std::chrono::steady_clock::time_point ahead_until{};
+    std::vector<unsigned char> ahead_pick;
+    // The guess the served narrow call found at its start besides its own layer's (the executor
+    // joins visit v + 1's guess before visit v's split, and visit v + 2's starts after v is ready,
+    // so it is the next request's layer) and its rows; -1: none. ahead_expect: the layer the last
+    // read-ahead was for, checked against the next request.
+    std::int64_t ahead_target = -1, ahead_expect = -1;
+    std::int32_t ahead_rows   = 0;
+    // NINFER_INK_PREFETCH_CHECK=1: every served call checks every table entry against the slots'
+    // records; NINFER_INK_PREFETCH_SYNC=1: each read-ahead is waited for at once.
+    bool ahead_check = false, ahead_sync = false;
     ExpertAheadStats ahead_counts;
 
     void ahead_add(const ExpertAheadStats& d) {
@@ -471,6 +476,8 @@ struct ExpertDelivery::Impl {
         c.wasted += d.wasted;
         c.no_room += d.no_room;
         c.to_lent += d.to_lent;
+        c.mismatch += d.mismatch;
+        c.ambiguous += d.ambiguous;
         c.narrow += d.narrow;
         c.serve_ns += d.serve_ns;
         c.wait_ns += d.wait_ns;
@@ -557,7 +564,10 @@ struct ExpertDelivery::Impl {
             ahead.erase(it);
             break;
         }
-        lent_slots[std::size_t(l)].ahead = false;
+        // Its expert's entries never pointed here: admit_lent must not point them nowhere.
+        auto& slot  = lent_slots[std::size_t(l)];
+        slot.ahead  = false;
+        slot.layer  = slot.expert = -1;
         ahead_add(d);
     }
 
@@ -639,7 +649,8 @@ struct ExpertDelivery::Impl {
             const std::int32_t l = any_lent() ? ahead_lent(li) : -1;
             if (l < 0) { return false; }
             auto& slot = lent_slots[std::size_t(l)];
-            if (slot.layer >= 0) {
+            if (slot.layer >= 0 &&
+                layers[std::size_t(slot.layer)].lent_of[std::size_t(slot.expert)] == l) {
                 point_nowhere(std::size_t(slot.layer), slot.expert);
                 ++delta.lent_evictions;
             }
@@ -672,27 +683,17 @@ struct ExpertDelivery::Impl {
         return true;
     }
 
-    // Once a narrow call is ready: the guess its next visit's layer holds, if one has arrived, and
-    // up to ahead_max of its guessed experts that no slot, lent slot or bank holds, best first.
+    // Once a narrow call is ready: the guess of the next request's layer (ahead_target) and up to
+    // ahead_max of its guessed experts that no slot, lent slot or bank holds, best first.
     void ahead_issue() {
+        if (ahead_target < 0) { return; }
+        const std::size_t li     = std::size_t(ahead_target);
+        const std::int32_t rows  = ahead_rows;
+        ahead_target             = -1;
+        if (li == call_layer || li >= layers.size()) { return; }
+        ahead_expect             = std::int64_t(li);
         const std::size_t stride = 1 + std::size_t(guess_rows) * guess_width;
         const auto* area = static_cast<const volatile std::int32_t*>(guess_host->data());
-        std::size_t li     = layers.size();
-        std::int32_t rows  = 0;
-        for (std::size_t l = 0; l < layers.size(); ++l) {
-            if (ahead_seen[l]) { continue; }
-            const std::int32_t n = area[l * stride];
-            if (n > 0 && std::uint32_t(n) <= guess_rows) {
-                li   = l;
-                rows = n;
-                break;
-            }
-        }
-        if (li == layers.size()) { return; }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        ahead_armed  = false;
-        ahead_seen[li] = 1;
-        if (li == call_layer) { return; } // its entries may be read now: nothing to place safely
         auto& layer       = layers[li];
         const int experts = int(layer.source.experts.size());
         const int held    = bank_holding(li);
@@ -727,8 +728,63 @@ struct ExpertDelivery::Impl {
                 }
             }
         }
+        if (ahead_sync && placed) { CUDA_CHECK(ninfer::wait_for_stream(ahead_stream)); }
         add(delta);
         ahead_add(d);
+    }
+
+    // NINFER_INK_PREFETCH_CHECK=1: every table entry against the slots' records (the mirror the
+    // served call uploads): null, its cache slot (held, not pending), its lent slot (not being
+    // filled) or a bank. Throws on the first violations, after printing them.
+    void ahead_verify(std::size_t li) {
+        int bad = 0;
+        const auto low  = reinterpret_cast<std::uintptr_t>(cache.p);
+        const auto high = low + cache_span;
+        for (std::size_t l = 0; l < layers.size() && bad < 8; ++l) {
+            const auto& layer = layers[l];
+            const auto n      = layer.source.experts.size();
+            const auto** mirror = static_cast<const void**>(layer.mirror->data());
+            const auto alias = layer.source.aliases[0];
+            for (std::size_t e = 0; e < n && bad < 8; ++e) {
+                const auto at = reinterpret_cast<std::uintptr_t>(mirror[e]);
+                if (at == 0) { continue; }
+                const char* why = nullptr;
+                if (at >= low && at < high) {
+                    const auto slot = layer.slot_of[e];
+                    if (slot < 0) {
+                        why = "cache entry without a slot";
+                    } else if (slots[std::size_t(slot)].pending) {
+                        why = "cache entry of a pending slot";
+                    } else if (slots[std::size_t(slot)].layer != std::int32_t(l) ||
+                               slots[std::size_t(slot)].expert != std::int32_t(e)) {
+                        why = "cache slot holds another expert";
+                    } else if (at != reinterpret_cast<std::uintptr_t>(
+                                         slot_blob(slot, alias.blob) + alias.offset)) {
+                        why = "cache entry off its slot";
+                    } else if (std::uint32_t(slot - pools[slots[std::size_t(slot)].pool].first) >=
+                               pools[slots[std::size_t(slot)].pool].count) {
+                        why = "cache slot past the backed ones";
+                    }
+                } else if (layer.lent_of[e] >= 0) {
+                    const auto& ls = lent_slots[std::size_t(layer.lent_of[e])];
+                    if (ls.ahead) {
+                        why = "lent entry of a slot being filled";
+                    } else if (ls.layer != std::int32_t(l) || ls.expert != std::int32_t(e)) {
+                        why = "lent slot holds another expert";
+                    } else if (!bank_lent[std::size_t(layer.lent_of[e]) / per_bank]) {
+                        why = "lent slot of a bank not lent";
+                    }
+                } else if (layer.bank_of[e] < 0) {
+                    why = "entry outside cache, lent slots and banks";
+                }
+                if (why) {
+                    std::fprintf(stderr, "hp-prefetch CHECK (call of layer %zu): layer %zu expert %zu: %s\n",
+                                 li, l, e, why);
+                    ++bad;
+                }
+            }
+        }
+        if (bad) { throw std::logic_error("expert delivery: NINFER_INK_PREFETCH_CHECK failed"); }
     }
 
     // A narrow call of layer li, before its misses are placed: the guess its layer holds against
@@ -2346,8 +2402,39 @@ struct ExpertDelivery::Impl {
         if (guess_host) {
             // hp-tune (N11''): the guess of this layer is scored and cleared.
             if (guess_score && !wide) { count_guess(li, needed); }
-            static_cast<volatile std::int32_t*>(guess_host->data())[li * (1 + std::size_t(guess_rows) * guess_width)] = 0;
-            if (!ahead_seen.empty()) { ahead_seen[li] = 0; }
+            const std::size_t stride = 1 + std::size_t(guess_rows) * guess_width;
+            auto* area = static_cast<volatile std::int32_t*>(guess_host->data());
+            area[li * stride] = 0;
+            if (ahead_max) {
+                // hp-tune (N11''): the next request's layer is the one whose guess is here now.
+                ExpertAheadStats d;
+                if (ahead_expect >= 0 && ahead_expect != std::int64_t(li)) {
+                    ++d.mismatch;
+                    if (ahead_check) {
+                        std::fprintf(stderr, "hp-prefetch CHECK: read ahead for layer %lld, the "
+                                             "next call is layer %zu\n",
+                                     (long long)ahead_expect, li);
+                    }
+                }
+                ahead_expect = ahead_target = -1;
+                ahead_rows   = 0;
+                if (!wide) {
+                    int found = 0;
+                    for (std::size_t l = 0; l < layers.size(); ++l) {
+                        const std::int32_t n = area[l * stride];
+                        if (l == li || n <= 0 || std::uint32_t(n) > guess_rows) { continue; }
+                        ++found;
+                        ahead_target = std::int64_t(l);
+                        ahead_rows   = n;
+                    }
+                    if (found > 1) {
+                        ++d.ambiguous;
+                        ahead_target = -1;
+                    }
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                }
+                ahead_add(d);
+            }
         }
         if (skip_on && !wide) {
             // hp-tune (miss-skip): the dropped experts were misses and routes before the split.
@@ -2495,6 +2582,7 @@ struct ExpertDelivery::Impl {
                                        cudaMemcpyHostToDevice, copies));
             ranges_dirty = false;
         }
+        if (ahead_check) { ahead_verify(li); }
         upload_tables();
         const auto waiting = std::chrono::steady_clock::now();
         CUDA_CHECK(ninfer::wait_for_stream(copies));
@@ -2626,18 +2714,6 @@ struct ExpertDelivery::Impl {
                 spinning = false;
             }
             if (!request) {
-                if (ahead_armed) {
-                    // hp-tune (N11''): the next visit's guess may arrive after the ready call;
-                    // the last visit of a call has none, so the wait for it ends.
-                    if (now >= ahead_until) {
-                        ahead_armed = false;
-                    } else {
-                        try { check(); ahead_issue(); }
-                        catch (...) { ahead_armed = false; fail(nullptr); }
-                    }
-                    std::this_thread::yield();
-                    continue;
-                }
                 if (now < active_until) { std::this_thread::yield(); }
                 else { std::this_thread::sleep_for(std::chrono::microseconds(20)); }
                 continue;
@@ -2661,10 +2737,8 @@ struct ExpertDelivery::Impl {
             served = request->sequence;
             if (served_ok && ahead_max) {
                 // hp-tune (N11''): the next visit's read-ahead before the round's copies.
-                ahead_armed = !call_wide;
-                ahead_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
-                try { if (ahead_armed) { ahead_issue(); } }
-                catch (...) { ahead_armed = false; fail(nullptr); }
+                try { ahead_issue(); }
+                catch (...) { ahead_target = -1; fail(nullptr); }
             }
             if (served_ok) {
                 try { post(); }
@@ -2927,8 +3001,7 @@ void ExpertDelivery::invalidate() {
     // hp-tune (N11''): drained, so every read-ahead copy has landed; none is judged.
     for (const auto& r : p.ahead) { p.spare_events.push_back(r.landed); }
     p.ahead.clear();
-    p.ahead_armed = false;
-    std::fill(p.ahead_seen.begin(), p.ahead_seen.end(), 0);
+    p.ahead_target = p.ahead_expect = -1;
     std::fill(p.bank_lent.begin(), p.bank_lent.end(), 0);
     std::memset(p.host_ranges->data(), 0, p.host_ranges->size());
     p.lent_ranges.fill();
@@ -3128,7 +3201,18 @@ void ExpertDelivery::enable_ahead(std::uint32_t per_visit, std::uint32_t top) {
         CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
         CUDA_CHECK(cudaStreamCreateWithPriority(&p.ahead_stream, cudaStreamNonBlocking, least));
     }
-    p.ahead_seen.assign(p.layers.size(), 0);
+    p.ahead_check = [] {
+        const char* v = std::getenv("NINFER_INK_PREFETCH_CHECK");
+        return v != nullptr && std::atoi(v) == 1;
+    }();
+    p.ahead_sync = [] {
+        const char* v = std::getenv("NINFER_INK_PREFETCH_SYNC");
+        return v != nullptr && std::atoi(v) == 1;
+    }();
+    if (p.ahead_check || p.ahead_sync) {
+        std::fprintf(stderr, "hp-tune: prefetch debug: check=%d sync=%d\n", int(p.ahead_check),
+                     int(p.ahead_sync));
+    }
     p.ahead_top = std::min(top, p.guess_width);
     p.ahead_max = per_visit;
 }

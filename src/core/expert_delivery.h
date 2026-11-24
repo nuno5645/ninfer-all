@@ -233,6 +233,9 @@ struct ExpertGuessStats {
 // for the call's copies (nanoseconds).
 struct ExpertAheadStats {
     std::uint64_t issued = 0, used = 0, waited = 0, wasted = 0, no_room = 0, to_lent = 0;
+    // mismatch: read ahead for a layer that was not the next call's (must stay 0); ambiguous:
+    // calls that found more than one other layer's guess (nothing read ahead).
+    std::uint64_t mismatch = 0, ambiguous = 0;
     std::uint64_t narrow = 0, serve_ns = 0, wait_ns = 0;
 };
 
